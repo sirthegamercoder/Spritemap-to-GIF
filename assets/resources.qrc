@@ -1,0 +1,8 @@
+<RCC>
+  <qresource prefix="ui">
+    <file>icon.ico</file>
+    <file>checkmark.png</file>
+    <file>up_arrow.png</file>
+    <file>down_arrow.png</file>
+  </qresource>
+</RCC>

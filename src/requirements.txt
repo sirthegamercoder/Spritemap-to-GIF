@@ -1,0 +1,5 @@
+PySide6-Essentials
+QtAwesome
+pillow
+numpy
+auto-py-to-exe # Used to packaging app
