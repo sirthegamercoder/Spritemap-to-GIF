@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from PySide6.QtGui import QIcon, QScreen
+from PySide6.QtGui import QIcon
 
 import qtawesome as qta
 
@@ -77,12 +77,9 @@ class DropLineEdit(QLineEdit):
         return True
 
     def _set_drag_style(self, active: bool):
-        if active:
-            self.setStyleSheet(
-                "QLineEdit { border: 2px dashed #4FC3F7; background-color: #2A3A44; }"
-            )
-        else:
-            self.setStyleSheet("")
+        self.setProperty("dragActive", active)
+        self.style().unpolish(self)
+        self.style().polish(self)
 
 
 class ExportWorker(QThread):
@@ -115,6 +112,10 @@ class ExportWorker(QThread):
         self.filter_single_frame = filter_single_frame
         self.filter_unused_symbols = filter_unused_symbols
         self.root_animation_only = root_animation_only
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
 
     def run(self):
         renderer = None
@@ -142,6 +143,10 @@ class ExportWorker(QThread):
 
             exported = 0
             for index, (name, frame_iterator) in enumerate(animations, start=1):
+                if self._cancel:
+                    self.log.emit("Export cancelled by user.")
+                    return
+
                 safe_name = self._sanitize_name(name)
                 self.progress.emit(index, total, safe_name)
                 self.log.emit(f"Rendering '{safe_name}'...")
@@ -192,7 +197,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Spritemap to GIF")
         self.setWindowIcon(QIcon(":ui/icon.ico"))
-        self.setFixedSize(750, 770)
+        self.setMinimumSize(750, 770)
+        self.resize(750, 770)
         self.worker = None
 
         self._build_ui()
@@ -200,7 +206,7 @@ class MainWindow(QMainWindow):
         self._center_window()
 
     def _center_window(self):
-        screen = QScreen.availableGeometry(QApplication.primaryScreen())
+        screen = QApplication.primaryScreen().availableGeometry()
         window_frame = self.frameGeometry()
         window_frame.moveCenter(screen.center())
         self.move(window_frame.topLeft())
@@ -374,10 +380,10 @@ class MainWindow(QMainWindow):
 
         if not all(
             (
-                animation_path.parent != Path(".") or animation_path.name,
-                spritemap_path.parent != Path(".") or spritemap_path.name,
-                atlas_path.parent != Path(".") or atlas_path.name,
-                output_dir.parent != Path(".") or output_dir.name,
+                self.animation_spritemap_edit.text().strip(),
+                self.spritemap_code_edit.text().strip(),
+                self.spritemap_image_edit.text().strip(),
+                self.output_edit.text().strip(),
             )
         ):
             QMessageBox.warning(
@@ -436,11 +442,17 @@ class MainWindow(QMainWindow):
     def _on_finished(self, message: str):
         self._set_ui_enabled(True)
         self.progress_bar.setFormat("Done")
+        if self.worker is not None:
+            self.worker.deleteLater()
+            self.worker = None
         QMessageBox.information(self, "Export Complete", message)
 
     def _on_error(self, message: str):
         self._set_ui_enabled(True)
         self.progress_bar.setFormat("Error")
+        if self.worker is not None:
+            self.worker.deleteLater()
+            self.worker = None
         QMessageBox.critical(self, "Export Failed", message)
 
     def _set_ui_enabled(self, enabled: bool):
@@ -497,6 +509,11 @@ class MainWindow(QMainWindow):
                 background-color: #262628;
                 color: #6D6D6D;
                 border: 1px solid #2F2F31;
+            }
+
+            QLineEdit[dragActive="true"] {
+                border: 2px dashed #4FC3F7;
+                background-color: #2A3A44;
             }
 
             QComboBox::drop-down {
@@ -681,8 +698,10 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         if self.worker and self.worker.isRunning():
-            self.worker.terminate()
-            self.worker.wait(2000)
+            self.worker.cancel()
+            if not self.worker.wait(5000):
+                self.worker.terminate()
+                self.worker.wait(1000)
         event.accept()
 
 
