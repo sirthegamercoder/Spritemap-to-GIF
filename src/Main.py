@@ -32,6 +32,59 @@ from core.renderer import AdobeSpritemapRenderer
 import core.resources
 
 
+class DropLineEdit(QLineEdit):
+    def __init__(self, file_mode: str = "file", extensions: tuple = (), parent=None):
+        super().__init__(parent)
+        self.file_mode = file_mode
+        self.extensions = extensions
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            urls = event.mimeData().urls()
+            if len(urls) == 1 and self._is_valid_path(urls[0].toLocalFile()):
+                event.acceptProposedAction()
+                self._set_drag_style(True)
+                return
+        event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self._set_drag_style(False)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        self._set_drag_style(False)
+        if event.mimeData().hasUrls():
+            urls = event.mimeData().urls()
+            if len(urls) == 1:
+                path = urls[0].toLocalFile()
+                if self._is_valid_path(path):
+                    self.setText(path)
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
+    def _is_valid_path(self, path: str) -> bool:
+        if not path:
+            return False
+        p = Path(path)
+        if self.file_mode == "folder":
+            return p.is_dir()
+        if not p.is_file():
+            return False
+        if self.extensions and p.suffix.lower() not in self.extensions:
+            return False
+        return True
+
+    def _set_drag_style(self, active: bool):
+        if active:
+            self.setStyleSheet(
+                "QLineEdit { border: 2px dashed #4FC3F7; background-color: #2A3A44; }"
+            )
+        else:
+            self.setStyleSheet("")
+
+
 class ExportWorker(QThread):
     progress = Signal(int, int, str)
     log = Signal(str)
@@ -163,22 +216,24 @@ class MainWindow(QMainWindow):
         files_layout = QFormLayout(files_group)
         files_layout.setLabelAlignment(Qt.AlignRight)
 
-        self.animation_spritemap_edit = QLineEdit()
-        self.animation_spritemap_edit.setPlaceholderText("animation.json")
+        self.animation_spritemap_edit = DropLineEdit(
+            file_mode="file", extensions=(".json",)
+        )
+        self.animation_spritemap_edit.setPlaceholderText("animation.json (drag & drop)")
         files_layout.addRow(
             self._icon_label("fa5s.file-code", "Animation JSON:"),
             self._file_row(self.animation_spritemap_edit, self._pick_animation),
         )
 
-        self.spritemap_code_edit = QLineEdit()
-        self.spritemap_code_edit.setPlaceholderText("spritemap.json")
+        self.spritemap_code_edit = DropLineEdit(file_mode="file", extensions=(".json",))
+        self.spritemap_code_edit.setPlaceholderText("spritemap.json (drag & drop)")
         files_layout.addRow(
             self._icon_label("fa5s.file-code", "Spritemap JSON:"),
             self._file_row(self.spritemap_code_edit, self._pick_spritemap),
         )
 
-        self.spritemap_image_edit = QLineEdit()
-        self.spritemap_image_edit.setPlaceholderText("spritemap.png")
+        self.spritemap_image_edit = DropLineEdit(file_mode="file", extensions=(".png",))
+        self.spritemap_image_edit.setPlaceholderText("spritemap.png (drag & drop)")
         files_layout.addRow(
             self._icon_label("fa5s.image", "Spritemap PNG:"),
             self._file_row(self.spritemap_image_edit, self._pick_atlas),
@@ -190,8 +245,8 @@ class MainWindow(QMainWindow):
         output_layout = QFormLayout(output_group)
         output_layout.setLabelAlignment(Qt.AlignRight)
 
-        self.output_edit = QLineEdit()
-        self.output_edit.setPlaceholderText("Choose output folder...")
+        self.output_edit = DropLineEdit(file_mode="folder")
+        self.output_edit.setPlaceholderText("Drop folder here or choose...")
         output_layout.addRow(
             self._icon_label("fa5s.folder", "Output Folder:"),
             self._file_row(self.output_edit, self._pick_output),
