@@ -1334,7 +1334,7 @@ class AdobeSpritemapRenderer:
         self.spritemap_json_path = spritemap_json_path
         self.atlas_image_path = atlas_image_path
 
-        with open(animation_path, "r", encoding="utf-8") as animation_file:
+        with open(animation_path, "r", encoding="utf-8-sig") as animation_file:
             self.animation_json = normalize_animation_document(
                 json.load(animation_file)
             )
