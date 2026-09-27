@@ -25,8 +25,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from shiboken6 import isValid
-
 import qtawesome as qta
 
 from core.renderer import AdobeSpritemapRenderer
@@ -140,7 +138,7 @@ class DropLineEdit(QLineEdit):
 class ExportWorker(QThread):
     progress = Signal(int, int, str)
     log = Signal(str)
-    finished_export = Signal(str)
+    finished_export = Signal(str, str)
     error = Signal(str)
 
     def __init__(
@@ -248,7 +246,7 @@ class ExportWorker(QThread):
             summary = f"Export complete. {exported} GIF(s) saved to:\n{output_path}"
             if failures:
                 summary += f"\n\n{failures} animation(s) failed — see log."
-            self.finished_export.emit(summary)
+            self.finished_export.emit(summary, str(output_path))
         except Exception as exc:
             self.error.emit(str(exc))
         finally:
@@ -500,6 +498,8 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_bar.setMaximum(1)
         self.progress_bar.setFormat("Starting...")
+        self.open_folder_button.setEnabled(False)
+        self._last_output_dir = None
 
         self.worker = ExportWorker(
             animation_path=str(animation_path),
@@ -517,14 +517,14 @@ class MainWindow(QMainWindow):
         self.worker.log.connect(self._on_log)
         self.worker.finished_export.connect(self._on_finished)
         self.worker.error.connect(self._on_error)
+        self.worker.finished.connect(self.worker.deleteLater)
         self.worker.start()
 
     def _cancel_export(self):
-        worker = self.worker
-        if worker is not None and isValid(worker) and worker.isRunning():
+        if self.worker is not None and self.worker.isRunning():
             self.cancel_button.setEnabled(False)
             self.progress_bar.setFormat("Cancelling...")
-            worker.cancel()
+            self.worker.cancel()
 
     def _open_output_folder(self):
         if self._last_output_dir and Path(self._last_output_dir).is_dir():
@@ -538,13 +538,14 @@ class MainWindow(QMainWindow):
     def _on_log(self, message: str):
         self.log_view.append(message)
 
-    def _on_finished(self, message: str):
+    def _on_finished(self, message: str, output_path: str):
         self._set_exporting(False)
         self.progress_bar.setFormat("Done")
-        out_dir = self.output_edit.text().strip()
-        if out_dir and Path(out_dir).is_dir():
-            self._last_output_dir = out_dir
+
+        if output_path and Path(output_path).is_dir():
+            self._last_output_dir = output_path
             self.open_folder_button.setEnabled(True)
+
         self.worker = None
         QMessageBox.information(self, "Export Complete", message)
 
@@ -569,12 +570,11 @@ class MainWindow(QMainWindow):
             file.close()
 
     def closeEvent(self, event):
-        worker = self.worker
-        if worker is not None and isValid(worker) and worker.isRunning():
-            worker.cancel()
-            if not worker.wait(5000):
-                worker.terminate()
-                worker.wait(1000)
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.cancel()
+            if not self.worker.wait(5000):
+                self.worker.terminate()
+                self.worker.wait(1000)
         self.worker = None
         event.accept()
 
