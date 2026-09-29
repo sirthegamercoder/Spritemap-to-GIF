@@ -4,7 +4,13 @@ from pathlib import Path
 
 from PIL import Image
 from PySide6.QtCore import (
-    Qt, QThread, QUrl, Signal, QFile, QIODevice, QSettings,
+    Qt,
+    QThread,
+    QUrl,
+    Signal,
+    QFile,
+    QIODevice,
+    QSettings,
 )
 from PySide6.QtGui import QDesktopServices, QIcon
 from PySide6.QtWidgets import (
@@ -199,7 +205,9 @@ class ExportWorker(QThread):
                 fps = getattr(renderer, "frame_rate", 0) or 0
                 if fps > 0:
                     duration = max(10, round(1000 / fps))
-                    self.log.emit(f"Using source framerate: {fps:g} fps -> {duration} ms")
+                    self.log.emit(
+                        f"Using source framerate: {fps:g} fps -> {duration} ms"
+                    )
                 else:
                     self.log.emit(
                         f"Source framerate not available; falling back to {duration} ms"
@@ -575,9 +583,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue(
             "options/filter_unused", self.filter_unused_check.isChecked()
         )
-        self.settings.setValue(
-            "options/root_only", self.root_only_check.isChecked()
-        )
+        self.settings.setValue("options/root_only", self.root_only_check.isChecked())
 
     def _start_export(self):
         animation_path = Path(self.animation_spritemap_edit.text().strip())
