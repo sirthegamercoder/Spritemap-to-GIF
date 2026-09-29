@@ -653,7 +653,7 @@ class ColorEffect:
             multiplier = np.array([1, 1, 1, effect["AM"]])
             offset = np.zeros(4)
         elif mode == "CBRT":
-            brightness = effect["BRT"]
+            brightness = max(-1.0, min(1.0, _safe_float(effect["BRT"], 0.0)))
             if brightness < 0:
                 multiplier = np.array(
                     [1 + brightness, 1 + brightness, 1 + brightness, 1]

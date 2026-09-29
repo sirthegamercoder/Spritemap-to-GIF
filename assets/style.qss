@@ -5,6 +5,10 @@ QMainWindow, QWidget {
     font-size: 10pt;
 }
 
+QWidget#iconLabelContainer {
+    background-color: transparent;
+}
+
 QLabel {
     background-color: transparent;
 }

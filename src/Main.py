@@ -3,7 +3,9 @@ import sys
 from pathlib import Path
 
 from PIL import Image
-from PySide6.QtCore import Qt, QThread, QUrl, Signal, QFile, QIODevice
+from PySide6.QtCore import (
+    Qt, QThread, QUrl, Signal, QFile, QIODevice, QSettings,
+)
 from PySide6.QtGui import QDesktopServices, QIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -89,7 +91,7 @@ class DropLineEdit(QLineEdit):
     def __init__(self, file_mode: str = "file", extensions: tuple = (), parent=None):
         super().__init__(parent)
         self.file_mode = file_mode
-        self.extensions = extensions
+        self.extensions = tuple(e.lower() for e in extensions)
         self.setAcceptDrops(True)
 
     def dragEnterEvent(self, event):
@@ -153,6 +155,7 @@ class ExportWorker(QThread):
         filter_single_frame: bool,
         filter_unused_symbols: bool,
         root_animation_only: bool,
+        use_source_fps: bool = False,
     ):
         super().__init__()
         self.animation_path = animation_path
@@ -165,6 +168,7 @@ class ExportWorker(QThread):
         self.filter_single_frame = filter_single_frame
         self.filter_unused_symbols = filter_unused_symbols
         self.root_animation_only = root_animation_only
+        self.use_source_fps = use_source_fps
         self._cancel = False
 
     def cancel(self):
@@ -190,6 +194,17 @@ class ExportWorker(QThread):
                 root_animation_only=self.root_animation_only,
             )
 
+            duration = self.duration
+            if self.use_source_fps:
+                fps = getattr(renderer, "frame_rate", 0) or 0
+                if fps > 0:
+                    duration = max(10, round(1000 / fps))
+                    self.log.emit(f"Using source framerate: {fps:g} fps -> {duration} ms")
+                else:
+                    self.log.emit(
+                        f"Source framerate not available; falling back to {duration} ms"
+                    )
+
             root_name = renderer.get_root_animation_name() or "spritemap"
             output_path = Path(self.output_dir) / sanitize_filename(root_name)
             output_path.mkdir(parents=True, exist_ok=True)
@@ -203,22 +218,25 @@ class ExportWorker(QThread):
 
             exported = 0
             failures = 0
+            seen_names: dict = {}
             for index, (name, frame_iterator) in enumerate(animations, start=1):
                 if self._cancel:
                     self.log.emit("Export cancelled by user.")
                     return
 
-                safe_name = sanitize_filename(name)
+                base_name = sanitize_filename(name)
+                count = seen_names.get(base_name, 0)
+                seen_names[base_name] = count + 1
+                safe_name = base_name if count == 0 else f"{base_name}_{count}"
+
                 self.progress.emit(index, total, safe_name)
                 self.log.emit(f"Rendering '{safe_name}'...")
 
+                frames = []
                 try:
-                    frames = []
                     for _, frame_image, _ in frame_iterator:
                         if self._cancel:
                             self.log.emit("Export cancelled by user.")
-                            for f in frames:
-                                f.close()
                             return
                         frames.append(frame_image)
 
@@ -230,18 +248,22 @@ class ExportWorker(QThread):
                     GifWriter.save(
                         frames,
                         gif_path,
-                        duration=self.duration,
+                        duration=duration,
                         loop=self.loop,
                         disposal=self.disposal,
                     )
-                    for frame in frames:
-                        frame.close()
-
                     exported += 1
                     self.log.emit(f"  Saved: {gif_path.name}")
                 except Exception as exc:
                     failures += 1
                     self.log.emit(f"  ERROR on '{safe_name}': {exc}")
+                finally:
+                    for frame in frames:
+                        try:
+                            frame.close()
+                        except Exception:
+                            pass
+                    frames.clear()
 
             summary = f"Export complete. {exported} GIF(s) saved to:\n{output_path}"
             if failures:
@@ -259,12 +281,14 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Spritemap to GIF")
         self.setWindowIcon(QIcon(":ui/icon.ico"))
-        self.setMinimumSize(750, 770)
-        self.resize(750, 770)
+        self.setMinimumSize(750, 795)
+        self.resize(750, 795)
         self.worker = None
         self._last_output_dir = None
+        self.settings = QSettings("Spritemap To Gif", "Persistence")
 
         self._build_ui()
+        self._load_settings()
         self._apply_styles()
         self._center_window()
 
@@ -334,6 +358,20 @@ class MainWindow(QMainWindow):
             self._icon_label("fa5s.clock", "Frame Duration:"), self.duration_spin
         )
 
+        self.use_source_fps_check = QCheckBox("Use source framerate")
+        self.use_source_fps_check.setChecked(False)
+        self.use_source_fps_check.setToolTip(
+            "Derive frame duration from the animation's declared framerate "
+            "instead of the value above."
+        )
+        self.use_source_fps_check.toggled.connect(
+            lambda checked: self.duration_spin.setEnabled(not checked)
+        )
+        settings_layout.addRow(
+            self._icon_label("fa5s.tachometer-alt", "Timing:"),
+            self.use_source_fps_check,
+        )
+
         self.loop_spin = QSpinBox()
         self.loop_spin.setRange(0, 100)
         self.loop_spin.setValue(0)
@@ -346,6 +384,21 @@ class MainWindow(QMainWindow):
         self.disposal_combo.addItem("2 - Restore to background", 2)
         self.disposal_combo.addItem("1 - Do not dispose", 1)
         self.disposal_combo.addItem("3 - Restore to previous", 3)
+        self.disposal_combo.setItemData(
+            0,
+            "Redraw background between frames. Best for most animations.",
+            Qt.ToolTipRole,
+        )
+        self.disposal_combo.setItemData(
+            1,
+            "Keep previous frame pixels. Can produce ghosting/trails.",
+            Qt.ToolTipRole,
+        )
+        self.disposal_combo.setItemData(
+            2,
+            "Restore the frame before the last one. Rarely needed.",
+            Qt.ToolTipRole,
+        )
         settings_layout.addRow(
             self._icon_label("fa5s.trash-alt", "Disposal:"), self.disposal_combo
         )
@@ -407,12 +460,20 @@ class MainWindow(QMainWindow):
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setPlaceholderText("Export log will appear here...")
+        self.log_view.document().setMaximumBlockCount(5000)
         main_layout.addWidget(self.log_view, stretch=1)
 
-    def _icon_label(self, icon_name: str, text: str) -> QLabel:
-        label = QLabel(text)
-        label.setPixmap(qta.icon(icon_name, color="#90CAF9").pixmap(16, 16))
-        return label
+    def _icon_label(self, icon_name: str, text: str) -> QWidget:
+        container = QWidget()
+        container.setObjectName("iconLabelContainer")
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        icon_label = QLabel()
+        icon_label.setPixmap(qta.icon(icon_name, color="#90CAF9").pixmap(16, 16))
+        layout.addWidget(icon_label)
+        layout.addWidget(QLabel(text))
+        return container
 
     def _file_row(self, line_edit: QLineEdit, handler) -> QWidget:
         container = QWidget()
@@ -457,6 +518,67 @@ class MainWindow(QMainWindow):
         if path:
             self.output_edit.setText(path)
 
+    def _load_settings(self):
+        for key, edit in (
+            ("paths/animation", self.animation_spritemap_edit),
+            ("paths/spritemap", self.spritemap_code_edit),
+            ("paths/atlas", self.spritemap_image_edit),
+            ("paths/output", self.output_edit),
+        ):
+            value = self.settings.value(key, "")
+            if value:
+                edit.setText(str(value))
+
+        def _restore_int(key, widget, default):
+            try:
+                widget.setValue(int(self.settings.value(key, default)))
+            except (TypeError, ValueError):
+                widget.setValue(default)
+
+        _restore_int("gif/duration", self.duration_spin, 42)
+        _restore_int("gif/loop", self.loop_spin, 0)
+
+        def _restore_bool(key, widget, default=False):
+            value = self.settings.value(key, default)
+            if isinstance(value, str):
+                value = value.lower() in {"true", "1", "yes"}
+            widget.setChecked(bool(value))
+
+        _restore_bool("gif/use_source_fps", self.use_source_fps_check, False)
+        _restore_bool("options/filter_single", self.filter_single_check, True)
+        _restore_bool("options/filter_unused", self.filter_unused_check, False)
+        _restore_bool("options/root_only", self.root_only_check, False)
+
+        disposal = self.settings.value("gif/disposal", 2)
+        try:
+            disposal = int(disposal)
+        except (TypeError, ValueError):
+            disposal = 2
+        idx = self.disposal_combo.findData(disposal)
+        if idx >= 0:
+            self.disposal_combo.setCurrentIndex(idx)
+
+    def _save_settings(self, animation_path, spritemap_path, atlas_path, output_dir):
+        self.settings.setValue("paths/animation", str(animation_path))
+        self.settings.setValue("paths/spritemap", str(spritemap_path))
+        self.settings.setValue("paths/atlas", str(atlas_path))
+        self.settings.setValue("paths/output", str(output_dir))
+        self.settings.setValue("gif/duration", self.duration_spin.value())
+        self.settings.setValue("gif/loop", self.loop_spin.value())
+        self.settings.setValue("gif/disposal", self.disposal_combo.currentData())
+        self.settings.setValue(
+            "gif/use_source_fps", self.use_source_fps_check.isChecked()
+        )
+        self.settings.setValue(
+            "options/filter_single", self.filter_single_check.isChecked()
+        )
+        self.settings.setValue(
+            "options/filter_unused", self.filter_unused_check.isChecked()
+        )
+        self.settings.setValue(
+            "options/root_only", self.root_only_check.isChecked()
+        )
+
     def _start_export(self):
         animation_path = Path(self.animation_spritemap_edit.text().strip())
         spritemap_path = Path(self.spritemap_code_edit.text().strip())
@@ -493,6 +615,15 @@ class MainWindow(QMainWindow):
             )
             return
 
+        try:
+            validate_animation_json(animation_path)
+            validate_animation_json(spritemap_path)
+        except ValueError as exc:
+            QMessageBox.critical(self, "Invalid Input", str(exc))
+            return
+
+        self._save_settings(animation_path, spritemap_path, atlas_path, output_dir)
+
         self._set_exporting(True)
         self.log_view.clear()
         self.progress_bar.setValue(0)
@@ -512,6 +643,7 @@ class MainWindow(QMainWindow):
             filter_single_frame=self.filter_single_check.isChecked(),
             filter_unused_symbols=self.filter_unused_check.isChecked(),
             root_animation_only=self.root_only_check.isChecked(),
+            use_source_fps=self.use_source_fps_check.isChecked(),
         )
         self.worker.progress.connect(self._on_progress)
         self.worker.log.connect(self._on_log)
@@ -523,7 +655,8 @@ class MainWindow(QMainWindow):
     def _cancel_export(self):
         if self.worker is not None and self.worker.isRunning():
             self.cancel_button.setEnabled(False)
-            self.progress_bar.setFormat("Cancelling...")
+            self.progress_bar.setFormat("Cancelling after current frame...")
+            self.log_view.append("Cancel requested, finishing current frame…")
             self.worker.cancel()
 
     def _open_output_folder(self):
@@ -553,6 +686,10 @@ class MainWindow(QMainWindow):
         self._set_exporting(False)
         self.progress_bar.setFormat("Error")
         self.worker = None
+        fallback = self.output_edit.text().strip()
+        if fallback and Path(fallback).is_dir():
+            self._last_output_dir = fallback
+            self.open_folder_button.setEnabled(True)
         QMessageBox.critical(self, "Export Failed", message)
 
     def _set_exporting(self, exporting: bool):
