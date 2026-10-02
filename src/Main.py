@@ -10,7 +10,6 @@ from PySide6.QtCore import (
     Signal,
     QFile,
     QIODevice,
-    QSettings,
 )
 from PySide6.QtGui import QDesktopServices, QIcon
 from PySide6.QtWidgets import (
@@ -71,7 +70,15 @@ class GifWriter:
     ) -> None:
         if not frames:
             return
-        first, *rest = frames
+
+        target_size = frames[0].size
+        normalized = []
+        for frame in frames:
+            if frame.size != target_size:
+                frame = frame.resize(target_size, Image.NEAREST)
+            normalized.append(frame)
+
+        first, *rest = normalized
         first.save(
             gif_path,
             save_all=True,
@@ -183,22 +190,19 @@ class ExportWorker(QThread):
     def run(self):
         renderer = None
         try:
-            try:
-                validate_animation_json(Path(self.animation_path))
-                validate_animation_json(Path(self.spritemap_json_path))
-            except ValueError as exc:
-                self.error.emit(str(exc))
-                return
-
             self.log.emit("Loading animation document...")
-            renderer = AdobeSpritemapRenderer(
-                animation_path=self.animation_path,
-                spritemap_json_path=self.spritemap_json_path,
-                atlas_image_path=self.atlas_image_path,
-                filter_single_frame=self.filter_single_frame,
-                filter_unused_symbols=self.filter_unused_symbols,
-                root_animation_only=self.root_animation_only,
-            )
+            try:
+                renderer = AdobeSpritemapRenderer(
+                    animation_path=self.animation_path,
+                    spritemap_json_path=self.spritemap_json_path,
+                    atlas_image_path=self.atlas_image_path,
+                    filter_single_frame=self.filter_single_frame,
+                    filter_unused_symbols=self.filter_unused_symbols,
+                    root_animation_only=self.root_animation_only,
+                )
+            except json.JSONDecodeError as exc:
+                self.error.emit(f"Invalid JSON: {exc}")
+                return
 
             duration = self.duration
             if self.use_source_fps:
@@ -230,6 +234,10 @@ class ExportWorker(QThread):
             for index, (name, frame_iterator) in enumerate(animations, start=1):
                 if self._cancel:
                     self.log.emit("Export cancelled by user.")
+                    self.finished_export.emit(
+                        f"Export cancelled. {exported} GIF(s) saved before cancellation.",
+                        str(output_path),
+                    )
                     return
 
                 base_name = sanitize_filename(name)
@@ -244,7 +252,17 @@ class ExportWorker(QThread):
                 try:
                     for _, frame_image, _ in frame_iterator:
                         if self._cancel:
+                            for frame in frames:
+                                try:
+                                    frame.close()
+                                except Exception:
+                                    pass
+                            frames.clear()
                             self.log.emit("Export cancelled by user.")
+                            self.finished_export.emit(
+                                f"Export cancelled. {exported} GIF(s) saved before cancellation.",
+                                str(output_path),
+                            )
                             return
                         frames.append(frame_image)
 
@@ -293,10 +311,8 @@ class MainWindow(QMainWindow):
         self.resize(750, 795)
         self.worker = None
         self._last_output_dir = None
-        self.settings = QSettings("Spritemap To Gif", "Persistence")
 
         self._build_ui()
-        self._load_settings()
         self._apply_styles()
         self._center_window()
 
@@ -499,14 +515,20 @@ class MainWindow(QMainWindow):
 
     def _pick_animation(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select Animation JSON", "", "JSON Files (*.json);;All Files (*)"
+            self,
+            "Select Animation JSON",
+            "",
+            "JSON Files (*.json);;All Files (*)",
         )
         if path:
             self.animation_spritemap_edit.setText(path)
 
     def _pick_spritemap(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select Spritemap JSON", "", "JSON Files (*.json);;All Files (*)"
+            self,
+            "Select Spritemap JSON",
+            "",
+            "JSON Files (*.json);;All Files (*)",
         )
         if path:
             self.spritemap_code_edit.setText(path)
@@ -522,68 +544,13 @@ class MainWindow(QMainWindow):
             self.spritemap_image_edit.setText(path)
 
     def _pick_output(self):
-        path = QFileDialog.getExistingDirectory(self, "Select Output Folder")
+        path = QFileDialog.getExistingDirectory(
+            self,
+            "Select Output Folder",
+            "",
+        )
         if path:
             self.output_edit.setText(path)
-
-    def _load_settings(self):
-        for key, edit in (
-            ("paths/animation", self.animation_spritemap_edit),
-            ("paths/spritemap", self.spritemap_code_edit),
-            ("paths/atlas", self.spritemap_image_edit),
-            ("paths/output", self.output_edit),
-        ):
-            value = self.settings.value(key, "")
-            if value:
-                edit.setText(str(value))
-
-        def _restore_int(key, widget, default):
-            try:
-                widget.setValue(int(self.settings.value(key, default)))
-            except (TypeError, ValueError):
-                widget.setValue(default)
-
-        _restore_int("gif/duration", self.duration_spin, 42)
-        _restore_int("gif/loop", self.loop_spin, 0)
-
-        def _restore_bool(key, widget, default=False):
-            value = self.settings.value(key, default)
-            if isinstance(value, str):
-                value = value.lower() in {"true", "1", "yes"}
-            widget.setChecked(bool(value))
-
-        _restore_bool("gif/use_source_fps", self.use_source_fps_check, False)
-        _restore_bool("options/filter_single", self.filter_single_check, True)
-        _restore_bool("options/filter_unused", self.filter_unused_check, False)
-        _restore_bool("options/root_only", self.root_only_check, False)
-
-        disposal = self.settings.value("gif/disposal", 2)
-        try:
-            disposal = int(disposal)
-        except (TypeError, ValueError):
-            disposal = 2
-        idx = self.disposal_combo.findData(disposal)
-        if idx >= 0:
-            self.disposal_combo.setCurrentIndex(idx)
-
-    def _save_settings(self, animation_path, spritemap_path, atlas_path, output_dir):
-        self.settings.setValue("paths/animation", str(animation_path))
-        self.settings.setValue("paths/spritemap", str(spritemap_path))
-        self.settings.setValue("paths/atlas", str(atlas_path))
-        self.settings.setValue("paths/output", str(output_dir))
-        self.settings.setValue("gif/duration", self.duration_spin.value())
-        self.settings.setValue("gif/loop", self.loop_spin.value())
-        self.settings.setValue("gif/disposal", self.disposal_combo.currentData())
-        self.settings.setValue(
-            "gif/use_source_fps", self.use_source_fps_check.isChecked()
-        )
-        self.settings.setValue(
-            "options/filter_single", self.filter_single_check.isChecked()
-        )
-        self.settings.setValue(
-            "options/filter_unused", self.filter_unused_check.isChecked()
-        )
-        self.settings.setValue("options/root_only", self.root_only_check.isChecked())
 
     def _start_export(self):
         animation_path = Path(self.animation_spritemap_edit.text().strip())
@@ -627,8 +594,6 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             QMessageBox.critical(self, "Invalid Input", str(exc))
             return
-
-        self._save_settings(animation_path, spritemap_path, atlas_path, output_dir)
 
         self._set_exporting(True)
         self.log_view.clear()
@@ -679,6 +644,7 @@ class MainWindow(QMainWindow):
 
     def _on_finished(self, message: str, output_path: str):
         self._set_exporting(False)
+        self.cancel_button.setEnabled(False)
         self.progress_bar.setFormat("Done")
 
         if output_path and Path(output_path).is_dir():
@@ -690,6 +656,7 @@ class MainWindow(QMainWindow):
 
     def _on_error(self, message: str):
         self._set_exporting(False)
+        self.cancel_button.setEnabled(False)
         self.progress_bar.setFormat("Error")
         self.worker = None
         fallback = self.output_edit.text().strip()

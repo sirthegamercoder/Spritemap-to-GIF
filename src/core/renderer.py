@@ -6,7 +6,7 @@ from typing import Any, Dict, Generator, Iterator, List, Optional, Set, Tuple
 import numpy as np
 from PIL import Image, ImageChops, ImageColor
 
-IDENTITY_M3D: List[float] = [
+IDENTITY_M3D: Tuple[float, ...] = (
     1.0,
     0.0,
     0.0,
@@ -23,7 +23,7 @@ IDENTITY_M3D: List[float] = [
     0.0,
     0.0,
     1.0,
-]
+)
 
 LOOP_MAP = {
     "loop": "LP",
@@ -39,6 +39,8 @@ SYMBOL_TYPE_MAP = {
     "movieclip": "MC",
     "button": "BTN",
 }
+
+FrameTuple = Tuple[str, Image.Image, Tuple[int, int, int, int, int, int]]
 
 
 def strip_trailing_digits(name: str) -> str:
@@ -429,7 +431,7 @@ def _matrix_from_decomposed(
 
 def _normalize_matrix(matrix: Optional[Any]) -> List[float]:
     if isinstance(matrix, list) and len(matrix) == 16:
-        return matrix
+        return list(matrix)
     if isinstance(matrix, list) and len(matrix) == 6:
         return _mx_to_m3d(matrix)
     if isinstance(matrix, dict):
@@ -605,7 +607,7 @@ class TransformMatrix:
 
     @classmethod
     def parse(cls, matrix_values):
-        if not matrix_values:
+        if not matrix_values or len(matrix_values) < 16:
             return cls()
         return cls(
             a=matrix_values[0],
@@ -739,6 +741,8 @@ class SpriteAtlas:
         self.resample = resample
         self.sprite_info = {}
         self.sprites = {}
+        self._composed_cache = {}
+        self._composed_cache_limit = 512
 
         actual_w, actual_h = atlas_image.size
         meta_size = spritemap_json.get("meta", {}).get("size", {})
@@ -762,6 +766,17 @@ class SpriteAtlas:
             }
 
     def get_sprite(self, name, matrix: TransformMatrix, color: ColorEffect):
+        cache_key = None
+        if matrix is not None and color is not None:
+            cache_key = (
+                name,
+                matrix.m.tobytes(),
+                hash(color),
+            )
+            cached = self._composed_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
         if name not in self.sprites:
             sprite_info = self.sprite_info.get(name)
             if sprite_info is None:
@@ -820,7 +835,15 @@ class SpriteAtlas:
         sprite = sprite.transform(
             transform_size, Image.AFFINE, data=matrix.data(), resample=self.resample
         )
-        return sprite.convert("RGBA"), (min_x, min_y)
+        sprite = sprite.convert("RGBA")
+        result = (sprite, (min_x, min_y))
+
+        if cache_key is not None:
+            if len(self._composed_cache) >= self._composed_cache_limit:
+                self._composed_cache.pop(next(iter(self._composed_cache)), None)
+            self._composed_cache[cache_key] = result
+
+        return result
 
     def close(self) -> None:
         if getattr(self, "sprites", None):
@@ -831,6 +854,15 @@ class SpriteAtlas:
                 except Exception:
                     pass
             self.sprites.clear()
+
+        if getattr(self, "_composed_cache", None):
+            for sprite, _ in self._composed_cache.values():
+                try:
+                    if sprite is not None:
+                        sprite.close()
+                except Exception:
+                    pass
+            self._composed_cache.clear()
 
         if getattr(self, "img", None) is not None:
             try:
@@ -964,7 +996,8 @@ class Symbols:
 
         for layer in reversed(self.timelines.get(name, [])):
             frames = layer.get("FR", [])
-            if not frames:
+            frame = self._find_frame(frames, frame_index)
+            if frame is None:
                 continue
 
             low = 0
@@ -1037,7 +1070,8 @@ class Symbols:
         canvas_stack = []
         for layer in reversed(self.timelines.get(name, [])):
             frames = layer.get("FR", [])
-            if not frames:
+            frame = self._find_frame(frames, frame_index)
+            if frame is None:
                 continue
 
             low = 0
@@ -1166,6 +1200,23 @@ class Symbols:
             return min(target, symbol_length - 1)
 
         return target % symbol_length
+
+    @staticmethod
+    def _find_frame(frames: List[dict], frame_index: int) -> Optional[dict]:
+        if not frames:
+            return None
+        low = 0
+        high = len(frames) - 1
+        while low != high:
+            mid = (low + high + 1) // 2
+            if frame_index < frames[mid]["I"]:
+                high = mid - 1
+            else:
+                low = mid
+        frame = frames[low]
+        if frame["I"] <= frame_index < frame["I"] + frame["DU"]:
+            return frame
+        return None
 
     def get_label_ranges(self, symbol_name: Optional[str]):
         return self.label_map.get(symbol_name, [])
@@ -1312,6 +1363,16 @@ def _infer_canvas_size(animation_json, spritemap_json, atlas_size):
     padding = 32.0
     inferred_width = int(math.ceil(max_abs_x * 2.0 + padding))
     inferred_height = int(math.ceil(max_abs_y * 2.0 + padding))
+
+    MAX_CANVAS_DIM = 16384
+    if inferred_width > MAX_CANVAS_DIM or inferred_height > MAX_CANVAS_DIM:
+        warnings.warn(
+            f"Inferred canvas size ({inferred_width}x{inferred_height}) exceeds "
+            f"the {MAX_CANVAS_DIM}px safety cap; clamping."
+        )
+        inferred_width = min(inferred_width, MAX_CANVAS_DIM)
+        inferred_height = min(inferred_height, MAX_CANVAS_DIM)
+
     return (
         max(atlas_size[0], inferred_width),
         max(atlas_size[1], inferred_height),
@@ -1387,8 +1448,6 @@ class AdobeSpritemapRenderer:
             return names
         return [n for n in names if n in self._referenced_symbols]
 
-    FrameTuple = Tuple[str, Image.Image, Tuple[int, int, int, int, int, int]]
-
     def build_animation_frames(
         self,
     ) -> Dict[str, List[Tuple[str, Image.Image, Tuple[int, int, int, int, int, int]]]]:
@@ -1433,7 +1492,7 @@ class AdobeSpritemapRenderer:
     def iter_animations(
         self,
     ) -> Generator[
-        Tuple[str, Iterator["AdobeSpritemapRenderer.FrameTuple"]],
+        Tuple[str, Iterator[FrameTuple]],
         None,
         None,
     ]:
