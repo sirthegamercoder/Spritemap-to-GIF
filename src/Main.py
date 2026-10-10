@@ -8,7 +8,7 @@ from tkinter import filedialog, messagebox
 from typing import Callable, Optional
 
 import customtkinter as ctk
-from PIL import Image
+from PIL import ImageTk, Image
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
 from core.renderer import AdobeSpritemapRenderer
@@ -272,7 +272,11 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
         self.TkdndVersion = TkinterDnD._require(self)
 
         self.title("Spritemap to GIF")
-        self.wm_iconbitmap(resource_path("icon.ico"))
+        if sys.platform == "win32":
+            self.wm_iconbitmap(resource_path("assets/icon.ico"))
+        else:
+            icon_app = ImageTk.PhotoImage(Image.open(resource_path("assets/icon.png")))
+            self.iconphoto(False, icon_app)
 
         self._window_size = (750, 770)
         self.minsize(750, 700)
