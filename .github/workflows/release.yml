@@ -1,6 +1,8 @@
 name: Release Build
 
 on:
+  branches: ["main"]
+    
   workflow_dispatch:
 
 jobs:
@@ -12,10 +14,10 @@ jobs:
         include:
           - os: ubuntu-latest
             script_path: "setup.sh"
-            shell_type: bash
           - os: windows-latest
             script_path: "setup.bat"
-            shell_type: cmd
+
+    if: github.event_name == 'workflow_dispatch'
 
     steps:
       - name: Checkout repository
@@ -26,10 +28,15 @@ jobs:
         with:
           python-version: "3.14"
 
-      - name: Install requirements
-        shell: ${{ matrix.shell_type }}
-        run: |
-          ${{ matrix.script_path }}
+      - name: Install requirements (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: ./${{ matrix.script_path }}
+
+      - name: Install requirements (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: ${{ matrix.script_path }}
 
       - name: Build release archive
         run: python build.py
@@ -37,5 +44,5 @@ jobs:
       - name: Upload build archive
         uses: actions/upload-artifact@v7
         with:
-          name: release-${{ runner.os }}
+          name: spritemap-to-gif-${{ runner.os }}
           path: dist/*.zip
