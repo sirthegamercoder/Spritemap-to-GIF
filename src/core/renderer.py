@@ -193,6 +193,8 @@ def _normalize_symbol_dictionary(section: Optional[Dict[str, Any]]) -> Dict[str,
 
     symbols: List[Dict[str, Any]] = []
     symbols_source = _get_first(section, "Symbols", "symbols") or []
+    if not isinstance(symbols_source, list):
+        return {}
     for symbol in symbols_source:
         if not isinstance(symbol, dict):
             continue
@@ -217,6 +219,8 @@ def _normalize_timeline(section: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         return {}
 
     layers_source = _get_first(section, "LAYERS", "layers") or []
+    if not isinstance(layers_source, list):
+        return {}
     layers = [
         layer for layer in (_normalize_layer(entry) for entry in layers_source) if layer
     ]
@@ -230,6 +234,8 @@ def _normalize_layer(layer: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         return {}
 
     frames_source = _get_first(layer, "Frames", "frames", "FRAMES") or []
+    if not isinstance(frames_source, list):
+        frames_source = []
     frames = [
         frame for frame in (_normalize_frame(entry) for entry in frames_source) if frame
     ]
@@ -239,7 +245,8 @@ def _normalize_layer(layer: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         normalized["LN"] = name
     if frames:
         normalized["FR"] = frames
-    layer_type = (_get_first(layer, "layerType", "Layer_type") or "").lower()
+    layer_type_raw = _get_first(layer, "layerType", "Layer_type")
+    layer_type = str(layer_type_raw).lower() if layer_type_raw is not None else ""
     if _truthy(layer.get("isClippingLayer")) or layer_type == "clipping":
         normalized["LT"] = "Clp"
     if _truthy(layer.get("hasClippingMask")):
@@ -252,6 +259,8 @@ def _normalize_frame(frame: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         return {}
 
     elements_source = _get_first(frame, "E", "elements", "Elements") or []
+    if not isinstance(elements_source, list):
+        elements_source = []
     elements = [
         element
         for element in (_normalize_element(entry) for entry in elements_source)
@@ -317,9 +326,8 @@ def _normalize_symbol_instance(instance: Optional[Dict[str, Any]]) -> Dict[str, 
     instance_name = _get_first(instance, "IN", "Instance_Name", "instanceName")
     if instance_name is not None:
         normalized["IN"] = instance_name
-    symbol_type = (
-        _get_first(instance, "ST", "symbolType", "symbol_type") or ""
-    ).lower()
+    symbol_type_raw = _get_first(instance, "ST", "symbolType", "symbol_type")
+    symbol_type = str(symbol_type_raw).lower() if symbol_type_raw is not None else ""
     normalized["ST"] = SYMBOL_TYPE_MAP.get(symbol_type, symbol_type.upper() or "G")
     normalized["FF"] = _safe_int(_get_first(instance, "FF", "firstFrame"), default=0)
     loop_mode = _get_first(instance, "LP", "loop", "Loop")
@@ -431,27 +439,32 @@ def _matrix_from_decomposed(
 
 def _normalize_matrix(matrix: Optional[Any]) -> List[float]:
     if isinstance(matrix, list) and len(matrix) == 16:
-        return list(matrix)
+        return [float(v) for v in matrix]
     if isinstance(matrix, list) and len(matrix) == 6:
         return _mx_to_m3d(matrix)
     if isinstance(matrix, dict):
+
+        def _get(key: str, default: float) -> float:
+            val = _get_first(matrix, key, key.upper())
+            return default if val is None else float(val)
+
         return [
-            _get_first(matrix, "m00", "M00") or 1.0,
-            _get_first(matrix, "m01", "M01") or 0.0,
-            _get_first(matrix, "m02", "M02") or 0.0,
-            _get_first(matrix, "m03", "M03") or 0.0,
-            _get_first(matrix, "m10", "M10") or 0.0,
-            _get_first(matrix, "m11", "M11") or 1.0,
-            _get_first(matrix, "m12", "M12") or 0.0,
-            _get_first(matrix, "m13", "M13") or 0.0,
-            _get_first(matrix, "m20", "M20") or 0.0,
-            _get_first(matrix, "m21", "M21") or 0.0,
-            _get_first(matrix, "m22", "M22") or 1.0,
-            _get_first(matrix, "m23", "M23") or 0.0,
-            _get_first(matrix, "m30", "M30") or 0.0,
-            _get_first(matrix, "m31", "M31") or 0.0,
-            _get_first(matrix, "m32", "M32") or 0.0,
-            _get_first(matrix, "m33", "M33") or 1.0,
+            _get("m00", 1.0),
+            _get("m01", 0.0),
+            _get("m02", 0.0),
+            _get("m03", 0.0),
+            _get("m10", 0.0),
+            _get("m11", 1.0),
+            _get("m12", 0.0),
+            _get("m13", 0.0),
+            _get("m20", 0.0),
+            _get("m21", 0.0),
+            _get("m22", 1.0),
+            _get("m23", 0.0),
+            _get("m30", 0.0),
+            _get("m31", 0.0),
+            _get("m32", 0.0),
+            _get("m33", 1.0),
         ]
     return list(IDENTITY_M3D)
 
@@ -459,7 +472,9 @@ def _normalize_matrix(matrix: Optional[Any]) -> List[float]:
 def _normalize_metadata(section: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not isinstance(section, dict):
         return {}
-    framerate = section.get("framerate") or section.get("frameRate")
+    framerate = section.get("framerate")
+    if framerate is None:
+        framerate = section.get("frameRate")
     if framerate is None:
         return {}
     try:
@@ -471,13 +486,25 @@ def _normalize_metadata(section: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
 def _collect_symbol_refs_from_layers(layers: Optional[List[dict]]) -> Set[str]:
     refs: Set[str] = set()
-    if not layers:
+    if not layers or not isinstance(layers, list):
         return refs
     for layer in layers:
-        for frame in layer.get("FR", []):
-            for element in frame.get("E", []):
+        if not isinstance(layer, dict):
+            continue
+        frames = layer.get("FR", [])
+        if not isinstance(frames, list):
+            continue
+        for frame in frames:
+            if not isinstance(frame, dict):
+                continue
+            elements = frame.get("E", [])
+            if not isinstance(elements, list):
+                continue
+            for element in elements:
+                if not isinstance(element, dict):
+                    continue
                 si = element.get("SI")
-                if si:
+                if isinstance(si, dict):
                     name = si.get("SN")
                     if name:
                         refs.add(name)
@@ -645,36 +672,44 @@ class ColorEffect:
 
     @classmethod
     def parse(cls, effect):
+        if not isinstance(effect, dict):
+            return cls()
         mode = effect.get("M")
-        if mode == "AD":
-            multiplier = np.array(
-                [effect["RM"], effect["GM"], effect["BM"], effect["AM"]]
-            )
-            offset = np.array([effect["RO"], effect["GO"], effect["BO"], effect["AO"]])
-        elif mode == "CA":
-            multiplier = np.array([1, 1, 1, effect["AM"]])
-            offset = np.zeros(4)
-        elif mode == "CBRT":
-            brightness = max(-1.0, min(1.0, _safe_float(effect["BRT"], 0.0)))
-            if brightness < 0:
+        try:
+            if mode == "AD":
                 multiplier = np.array(
-                    [1 + brightness, 1 + brightness, 1 + brightness, 1]
+                    [effect["RM"], effect["GM"], effect["BM"], effect["AM"]]
                 )
+                offset = np.array(
+                    [effect["RO"], effect["GO"], effect["BO"], effect["AO"]]
+                )
+            elif mode == "CA":
+                multiplier = np.array([1, 1, 1, effect["AM"]])
                 offset = np.zeros(4)
-            else:
+            elif mode == "CBRT":
+                brightness = max(-1.0, min(1.0, _safe_float(effect["BRT"], 0.0)))
+                if brightness < 0:
+                    multiplier = np.array(
+                        [1 + brightness, 1 + brightness, 1 + brightness, 1]
+                    )
+                    offset = np.zeros(4)
+                else:
+                    multiplier = np.array(
+                        [1 - brightness, 1 - brightness, 1 - brightness, 1]
+                    )
+                    offset = brightness * np.array([255, 255, 255, 0])
+            elif mode == "T":
+                tint_color = ImageColor.getrgb(effect["TC"])
+                tint_multiplier = effect["TM"]
                 multiplier = np.array(
-                    [1 - brightness, 1 - brightness, 1 - brightness, 1]
+                    [1 - tint_multiplier, 1 - tint_multiplier, 1 - tint_multiplier, 1]
                 )
-                offset = brightness * np.array([255, 255, 255, 0])
-        elif mode == "T":
-            tint_color = ImageColor.getrgb(effect["TC"])
-            tint_multiplier = effect["TM"]
-            multiplier = np.array(
-                [1 - tint_multiplier, 1 - tint_multiplier, 1 - tint_multiplier, 1]
-            )
-            offset = tint_multiplier * np.array([*tint_color, 0])
-        else:
-            warnings.warn(f"Unsupported color effect: {effect}")
+                offset = tint_multiplier * np.array([*tint_color, 0])
+            else:
+                warnings.warn(f"Unsupported color effect: {effect}")
+                return cls()
+        except (KeyError, TypeError, ValueError) as exc:
+            warnings.warn(f"Malformed color effect {effect!r}: {exc}")
             return cls()
 
         return cls((multiplier, offset))
@@ -691,7 +726,7 @@ class ColorEffect:
             image = Image.fromarray(arr, mode="RGBA")
         except TypeError:
             h, w = arr.shape[:2]
-            image = Image.frombytes("RGBA", (w, h), arr.tobytes())
+            image = Image.frombytes("RGBA", (w, h), np.ascontiguousarray(arr).tobytes())
         return image.convert(mode)
 
     def __eq__(self, other):
@@ -748,14 +783,18 @@ class SpriteAtlas:
         meta_size = spritemap_json.get("meta", {}).get("size", {})
         declared_w = meta_size.get("w", actual_w)
         declared_h = meta_size.get("h", actual_h)
-        self._scale_x = actual_w / declared_w if declared_w > 0 else 1.0
-        self._scale_y = actual_h / declared_h if declared_h > 0 else 1.0
+        self._scale_x = actual_w / declared_w if declared_w and declared_w > 0 else 1.0
+        self._scale_y = actual_h / declared_h if declared_h and declared_h > 0 else 1.0
         self._needs_rescale = not (
             0.99 < self._scale_x < 1.01 and 0.99 < self._scale_y < 1.01
         )
 
         for sprite in spritemap_json.get("ATLAS", {}).get("SPRITES", []):
+            if not isinstance(sprite, dict):
+                continue
             data = sprite["SPRITE"] if "SPRITE" in sprite else sprite
+            if not isinstance(data, dict) or "name" not in data:
+                continue
             x = data.get("x", 0)
             y = data.get("y", 0)
             w = data.get("w", 0)
@@ -1000,18 +1039,6 @@ class Symbols:
             if frame is None:
                 continue
 
-            low = 0
-            high = len(frames) - 1
-            while low != high:
-                mid = (low + high + 1) // 2
-                if frame_index < frames[mid]["I"]:
-                    high = mid - 1
-                else:
-                    low = mid
-            frame = frames[low]
-            if not (frame["I"] <= frame_index < frame["I"] + frame["DU"]):
-                continue
-
             for element in frame.get("E", []):
                 if "SI" in element:
                     instance = element["SI"]
@@ -1074,18 +1101,6 @@ class Symbols:
             if frame is None:
                 continue
 
-            low = 0
-            high = len(frames) - 1
-            while low != high:
-                mid = (low + high + 1) // 2
-                if frame_index < frames[mid]["I"]:
-                    high = mid - 1
-                else:
-                    low = mid
-            frame = frames[low]
-            if not (frame["I"] <= frame_index < frame["I"] + frame["DU"]):
-                continue
-
             if (layer.get("Clpb") and not canvas_stack) or layer.get("LT") == "Clp":
                 canvas_stack.append(canvas)
                 canvas = Image.new("RGBA", self.canvas_size, color=(0, 0, 0, 0))
@@ -1128,6 +1143,15 @@ class Symbols:
                         canvas.alpha_composite(sprite, dest=dest)
 
             if layer.get("LT") == "Clp":
+                if len(canvas_stack) < 2:
+                    warnings.warn(
+                        f"Clipping layer `{layer.get('LN')}` in symbol "
+                        f"`{name}` has no base layer to mask; skipping mask."
+                    )
+                    if canvas_stack:
+                        canvas = canvas_stack.pop()
+                    continue
+
                 mask_canvas = canvas
                 masked_canvas = canvas_stack.pop()
                 base_canvas = canvas_stack.pop()
@@ -1144,11 +1168,9 @@ class Symbols:
                     masked_alpha = masked_canvas.getchannel("A")
 
                     mask_alpha = np.array(mask_canvas.getchannel("A"))
-                    mask_alpha = (
-                        mask_alpha
-                        if np.max(mask_alpha) == 0
-                        else mask_alpha / np.max(mask_alpha) * 255
-                    )
+                    max_mask = np.max(mask_alpha)
+                    if max_mask > 0:
+                        mask_alpha = mask_alpha / max_mask * 255
                     mask_alpha_arr = mask_alpha.clip(0, 255).astype("uint8")
                     try:
                         mask_alpha = Image.fromarray(mask_alpha_arr, "L")
@@ -1238,7 +1260,11 @@ def _collect_sprite_sizes(
 ) -> Dict[str, Tuple[int, int]]:
     sizes: Dict[str, Tuple[int, int]] = {}
     for sprite in spritemap_json.get("ATLAS", {}).get("SPRITES", []):
+        if not isinstance(sprite, dict):
+            continue
         data = sprite.get("SPRITE", sprite)
+        if not isinstance(data, dict):
+            continue
         name = data.get("name")
         if not name:
             continue
@@ -1278,6 +1304,8 @@ def _element_bounds(element, sprite_sizes, symbol_bounds_fn):
         return None
     if "ASI" in element:
         atlas = element["ASI"]
+        if not isinstance(atlas, dict):
+            return None
         sprite_name = atlas.get("N")
         if not sprite_name:
             return None
@@ -1289,6 +1317,8 @@ def _element_bounds(element, sprite_sizes, symbol_bounds_fn):
         return _transform_bounds((0.0, 0.0, float(width), float(height)), matrix)
     if "SI" in element:
         instance = element["SI"]
+        if not isinstance(instance, dict):
+            return None
         child_name = instance.get("SN")
         if not child_name:
             return None
@@ -1320,29 +1350,30 @@ def _infer_canvas_size(animation_json, spritemap_json, atlas_size):
         if symbol_name in visiting:
             return None
         visiting.add(symbol_name)
+        try:
+            min_x = float("inf")
+            min_y = float("inf")
+            max_x = float("-inf")
+            max_y = float("-inf")
 
-        min_x = float("inf")
-        min_y = float("inf")
-        max_x = float("-inf")
-        max_y = float("-inf")
+            for layer in timelines.get(symbol_name, []):
+                for frame in layer.get("FR", []):
+                    for element in frame.get("E", []):
+                        bounds = _element_bounds(element, sprite_sizes, symbol_bounds)
+                        if not bounds:
+                            continue
+                        min_x = min(min_x, bounds[0])
+                        min_y = min(min_y, bounds[1])
+                        max_x = max(max_x, bounds[2])
+                        max_y = max(max_y, bounds[3])
 
-        for layer in timelines.get(symbol_name, []):
-            for frame in layer.get("FR", []):
-                for element in frame.get("E", []):
-                    bounds = _element_bounds(element, sprite_sizes, symbol_bounds)
-                    if not bounds:
-                        continue
-                    min_x = min(min_x, bounds[0])
-                    min_y = min(min_y, bounds[1])
-                    max_x = max(max_x, bounds[2])
-                    max_y = max(max_y, bounds[3])
+            if min_x == float("inf"):
+                bounds_cache[symbol_name] = None
+            else:
+                bounds_cache[symbol_name] = (min_x, min_y, max_x, max_y)
+        finally:
+            visiting.discard(symbol_name)
 
-        visiting.remove(symbol_name)
-
-        if min_x == float("inf"):
-            bounds_cache[symbol_name] = None
-        else:
-            bounds_cache[symbol_name] = (min_x, min_y, max_x, max_y)
         return bounds_cache[symbol_name]
 
     for symbol_name in timelines.keys():
@@ -1404,30 +1435,34 @@ class AdobeSpritemapRenderer:
             spritemap_json = json.loads(spritemap_file.read().decode("utf-8-sig"))
 
         atlas_image = Image.open(atlas_image_path)
+        try:
+            if canvas_size is None:
+                canvas_size = _infer_canvas_size(
+                    self.animation_json,
+                    spritemap_json,
+                    atlas_image.size,
+                )
+            self.frame_rate = self.animation_json.get("MD", {}).get("FRT", 24)
+            self.filter_single_frame = filter_single_frame
+            self.filter_unused_symbols = filter_unused_symbols
+            self.root_animation_only = root_animation_only
 
-        if canvas_size is None:
-            canvas_size = _infer_canvas_size(
-                self.animation_json,
-                spritemap_json,
-                atlas_image.size,
+            direct_children = collect_direct_child_symbols(self.animation_json)
+            if direct_children:
+                self._referenced_symbols = direct_children
+            elif filter_unused_symbols:
+                self._referenced_symbols = collect_referenced_symbols(
+                    self.animation_json
+                )
+            else:
+                self._referenced_symbols = None
+
+            self.sprite_atlas = SpriteAtlas(
+                spritemap_json, atlas_image, canvas_size, resample
             )
-        self.frame_rate = self.animation_json.get("MD", {}).get("FRT", 24)
-        self.filter_single_frame = filter_single_frame
-        self.filter_unused_symbols = filter_unused_symbols
-        self.root_animation_only = root_animation_only
-
-        direct_children = collect_direct_child_symbols(self.animation_json)
-        if direct_children:
-            self._referenced_symbols = direct_children
-        elif filter_unused_symbols:
-            self._referenced_symbols = collect_referenced_symbols(self.animation_json)
-        else:
-            self._referenced_symbols = None
-
-        self.sprite_atlas = SpriteAtlas(
-            spritemap_json, atlas_image, canvas_size, resample
-        )
-        self.symbols = Symbols(self.animation_json, self.sprite_atlas, canvas_size)
+            self.symbols = Symbols(self.animation_json, self.sprite_atlas, canvas_size)
+        finally:
+            atlas_image.close()
 
     def get_root_animation_name(self) -> Optional[str]:
         an = self.animation_json.get("AN", {})
@@ -1569,6 +1604,8 @@ class AdobeSpritemapRenderer:
                 max_y = max(max_y, bbox[3])
 
         if min_x > max_x:
+            for _, frame in frames_with_index:
+                frame.close()
             return []
 
         prefix = frame_name_prefix or (symbol_name if symbol_name else "timeline")

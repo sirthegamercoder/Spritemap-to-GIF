@@ -1,1 +1,1 @@
-from . import renderer, resources
+from . import renderer

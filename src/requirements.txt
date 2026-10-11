@@ -1,5 +1,5 @@
-PySide6-Essentials
-QtAwesome
+customtkinter 
+tkinterdnd2 
 pillow
 numpy
 auto-py-to-exe # Used to packaging app
