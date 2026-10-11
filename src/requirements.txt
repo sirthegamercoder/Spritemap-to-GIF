@@ -1,5 +1,6 @@
 customtkinter 
-tkinterdnd2 
+tkinterdnd2
+tkinter-icons[fluent-regular] 
 pillow
 numpy
 auto-py-to-exe # Used to packaging app

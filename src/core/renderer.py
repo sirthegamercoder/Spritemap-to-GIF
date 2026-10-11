@@ -2,6 +2,7 @@ import json
 import math
 import warnings
 from typing import Any, Dict, Generator, Iterator, List, Optional, Set, Tuple
+from collections import OrderedDict
 
 import numpy as np
 from PIL import Image, ImageChops, ImageColor
@@ -281,24 +282,6 @@ def _normalize_element(element: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not isinstance(element, dict):
         return {}
 
-    if "ASI" in element:
-        return element
-    if "SI" in element:
-        bitmap_instance = _normalize_symbol_bitmap(element.get("SI"))
-        if bitmap_instance:
-            return {"ASI": bitmap_instance}
-        return element
-
-    symbol_instance = _get_first(
-        element, "SI", "SYMBOL_Instance", "symbol_instance", "symbolInstance"
-    )
-    if symbol_instance is not None:
-        bitmap_instance = _normalize_symbol_bitmap(symbol_instance)
-        if bitmap_instance:
-            return {"ASI": bitmap_instance}
-        symbol = _normalize_symbol_instance(symbol_instance)
-        if symbol:
-            return {"SI": symbol}
     atlas_instance = _get_first(
         element,
         "ASI",
@@ -310,6 +293,19 @@ def _normalize_element(element: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         atlas = _normalize_atlas_instance(atlas_instance)
         if atlas:
             return {"ASI": atlas}
+        return {}
+
+    symbol_instance = _get_first(
+        element, "SI", "SYMBOL_Instance", "symbol_instance", "symbolInstance"
+    )
+    if symbol_instance is not None:
+        bitmap_instance = _normalize_symbol_bitmap(symbol_instance)
+        if bitmap_instance:
+            return {"ASI": bitmap_instance}
+        symbol = _normalize_symbol_instance(symbol_instance)
+        if symbol:
+            return {"SI": symbol}
+
     return {}
 
 
@@ -443,10 +439,14 @@ def _normalize_matrix(matrix: Optional[Any]) -> List[float]:
     if isinstance(matrix, list) and len(matrix) == 6:
         return _mx_to_m3d(matrix)
     if isinstance(matrix, dict):
+        lower = {k.lower(): v for k, v in matrix.items() if isinstance(k, str)}
 
         def _get(key: str, default: float) -> float:
-            val = _get_first(matrix, key, key.upper())
-            return default if val is None else float(val)
+            val = lower.get(key, default)
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return default
 
         return [
             _get("m00", 1.0),
@@ -532,11 +532,6 @@ def collect_referenced_symbols(animation_json: dict) -> Set[str]:
                 if child not in referenced:
                     stack.append(child)
     return referenced
-
-
-def collect_direct_child_symbols(animation_json: dict) -> Set[str]:
-    root_layers = animation_json.get("AN", {}).get("TL", {}).get("L", [])
-    return _collect_symbol_refs_from_layers(root_layers)
 
 
 def _frame_duration(frame: dict) -> int:
@@ -626,11 +621,15 @@ def extract_label_ranges_from_layers(
 
 
 class TransformMatrix:
+    __slots__ = ("m", "_data", "_m_bytes")
+
     def __init__(self, m=None, a=1, b=0, c=0, d=0, e=1, f=0):
         if m is None:
             self.m = np.array([[a, b, c], [d, e, f], [0, 0, 1]], dtype=float)
         else:
             self.m = m
+        self._data = None
+        self._m_bytes = None
 
     @classmethod
     def parse(cls, matrix_values):
@@ -646,7 +645,14 @@ class TransformMatrix:
         )
 
     def data(self):
-        return np.linalg.inv(self.m).reshape(-1)[:6]
+        if self._data is None:
+            self._data = tuple(np.linalg.inv(self.m).reshape(-1)[:6])
+        return self._data
+
+    def bytes(self) -> bytes:
+        if self._m_bytes is None:
+            self._m_bytes = self.m.tobytes()
+        return self._m_bytes
 
     def __matmul__(self, other):
         if not isinstance(other, TransformMatrix):
@@ -658,12 +664,10 @@ class TransformMatrix:
         return f"TransformMatrix(a={a}, b={b}, c={c}, d={d}, e={e}, f={f})"
 
     def __eq__(self, other):
-        return (
-            isinstance(other, TransformMatrix) and self.m.tobytes() == other.m.tobytes()
-        )
+        return isinstance(other, TransformMatrix) and self.bytes() == other.bytes()
 
     def __hash__(self):
-        return hash(self.m.tobytes())
+        return hash(self.bytes())
 
 
 class ColorEffect:
@@ -776,8 +780,9 @@ class SpriteAtlas:
         self.resample = resample
         self.sprite_info = {}
         self.sprites = {}
-        self._composed_cache = {}
+        self._composed_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
         self._composed_cache_limit = 512
+        self._warned_oob: set = set()
 
         actual_w, actual_h = atlas_image.size
         meta_size = spritemap_json.get("meta", {}).get("size", {})
@@ -804,16 +809,13 @@ class SpriteAtlas:
                 "rotated": data.get("rotated", False),
             }
 
-    def get_sprite(self, name, matrix: TransformMatrix, color: ColorEffect):
+    def get_sprite(self, name, matrix, color, canvas_width, canvas_height):
         cache_key = None
         if matrix is not None and color is not None:
-            cache_key = (
-                name,
-                matrix.m.tobytes(),
-                hash(color),
-            )
+            cache_key = (name, matrix.bytes(), hash(color))
             cached = self._composed_cache.get(cache_key)
             if cached is not None:
+                self._composed_cache.move_to_end(cache_key)
                 return cached
 
         if name not in self.sprites:
@@ -851,22 +853,19 @@ class SpriteAtlas:
         min_y = math.floor(min(corners[1]))
         max_y = math.ceil(max(corners[1]))
 
-        if (
-            max_x < 0
-            or self.canvas_width <= min_x
-            or max_y < 0
-            or self.canvas_height <= min_y
-        ):
-            warnings.warn(
-                f"Sprite `{name}` is out of bounds, increase canvas size: "
-                f"({min_x:.2f}, {min_y:.2f}) x ({max_x:.2f}, {max_y:.2f})"
-            )
+        if max_x < 0 or canvas_width <= min_x or max_y < 0 or canvas_height <= min_y:
+            if name not in self._warned_oob:
+                self._warned_oob.add(name)
+                warnings.warn(
+                    f"Sprite `{name}` is out of bounds, increase canvas size: "
+                    f"({min_x:.2f}, {min_y:.2f}) x ({max_x:.2f}, {max_y:.2f})"
+                )
             return None, None
 
         min_x = max(0, min_x)
-        max_x = min(self.canvas_width - 1, max_x)
+        max_x = min(canvas_width - 1, max_x)
         min_y = max(0, min_y)
-        max_y = min(self.canvas_height - 1, max_y)
+        max_y = min(canvas_height - 1, max_y)
 
         transform_size = (max_x - min_x + 1, max_y - min_y + 1)
         matrix = TransformMatrix(c=-min_x, f=-min_y) @ matrix
@@ -878,10 +877,10 @@ class SpriteAtlas:
         result = (sprite, (min_x, min_y))
 
         if cache_key is not None:
-            if len(self._composed_cache) >= self._composed_cache_limit:
-                self._composed_cache.pop(next(iter(self._composed_cache)), None)
             self._composed_cache[cache_key] = result
-
+            self._composed_cache.move_to_end(cache_key)
+            while len(self._composed_cache) > self._composed_cache_limit:
+                self._composed_cache.popitem(last=False)
         return result
 
     def close(self) -> None:
@@ -902,6 +901,7 @@ class SpriteAtlas:
                 except Exception:
                     pass
             self._composed_cache.clear()
+            self._warned_oob.clear()
 
         if getattr(self, "img", None) is not None:
             try:
@@ -928,11 +928,33 @@ def _union_bounds(
     )
 
 
+def _intersect_bounds(
+    a: Optional[Tuple[int, int, int, int]],
+    b: Optional[Tuple[int, int, int, int]],
+) -> Optional[Tuple[int, int, int, int]]:
+    if a is None or b is None:
+        return None
+    left = max(a[0], b[0])
+    top = max(a[1], b[1])
+    right = min(a[2], b[2])
+    bottom = min(a[3], b[3])
+    if left >= right or top >= bottom:
+        return None
+    return (left, top, right, bottom)
+
+
 class Symbols:
-    def __init__(self, animation_json, sprite_atlas, canvas_size):
+    def __init__(
+        self,
+        animation_json,
+        sprite_atlas,
+        canvas_size,
+        animate_movie_clips: bool = True,
+    ):
         self.background_color = (0, 0, 0, 0)
         self.canvas_size = canvas_size
         self.sprite_atlas = sprite_atlas
+        self.animate_movie_clips = animate_movie_clips
         self.timelines = {}
 
         for symbol in animation_json.get("SD", {}).get("S", []):
@@ -956,7 +978,12 @@ class Symbols:
     def render_symbol(self, name, frame_index):
         canvas = Image.new("RGBA", self.canvas_size, color=self.background_color)
         self._render_symbol(
-            canvas, name, frame_index, self.center_in_canvas, ColorEffect()
+            canvas,
+            name,
+            frame_index,
+            self.center_in_canvas,
+            ColorEffect(),
+            canvas_size=self.canvas_size,
         )
         return canvas
 
@@ -999,41 +1026,82 @@ class Symbols:
         compact_w = max(1, vp_x2 - vp_x)
         compact_h = max(1, vp_y2 - vp_y)
 
-        orig_canvas_size = self.canvas_size
-        orig_atlas_w = self.sprite_atlas.canvas_width
-        orig_atlas_h = self.sprite_atlas.canvas_height
-
-        self.canvas_size = (compact_w, compact_h)
-        self.sprite_atlas.canvas_width = compact_w
-        self.sprite_atlas.canvas_height = compact_h
+        canvas = Image.new("RGBA", (compact_w, compact_h), color=self.background_color)
 
         compact_center = TransformMatrix(
-            c=orig_canvas_size[0] // 2 - vp_x,
-            f=orig_canvas_size[1] // 2 - vp_y,
+            c=self.canvas_size[0] // 2 - vp_x,
+            f=self.canvas_size[1] // 2 - vp_y,
         )
 
-        try:
-            canvas = Image.new(
-                "RGBA", (compact_w, compact_h), color=self.background_color
-            )
-            self._render_symbol(
-                canvas, name, frame_index, compact_center, ColorEffect()
-            )
-            return canvas
-        finally:
-            self.canvas_size = orig_canvas_size
-            self.sprite_atlas.canvas_width = orig_atlas_w
-            self.sprite_atlas.canvas_height = orig_atlas_h
+        self._render_symbol(
+            canvas,
+            name,
+            frame_index,
+            compact_center,
+            ColorEffect(),
+            canvas_size=(compact_w, compact_h),
+        )
+        return canvas
 
     def _compute_bounds(
         self,
         name: Optional[str],
         frame_index: int,
         matrix: TransformMatrix,
+        _depth: int = 0,
+    ) -> Optional[Tuple[int, int, int, int]]:
+        if _depth > 32:
+            return None
+
+        layers = list(reversed(self.timelines.get(name, [])))
+        return self._compute_layer_group_bounds(
+            layers, frame_index, matrix, _depth=_depth
+        )
+
+    def _compute_layer_group_bounds(
+        self,
+        layers: List[dict],
+        frame_index: int,
+        matrix: TransformMatrix,
+        _depth: int = 0,
     ) -> Optional[Tuple[int, int, int, int]]:
         combined: Optional[Tuple[int, int, int, int]] = None
 
-        for layer in reversed(self.timelines.get(name, [])):
+        for group in self._group_clip_layers(layers):
+            clip_layer = group[-1] if group[-1].get("LT") == "Clp" else None
+            base_layers = group[:-1] if clip_layer is not None else group
+
+            if clip_layer is None:
+                group_bounds = self._compute_plain_group_bounds(
+                    base_layers, frame_index, matrix, _depth=_depth
+                )
+                combined = _union_bounds(combined, group_bounds)
+                continue
+
+            if not base_layers:
+                continue
+
+            base_bounds = self._compute_layer_group_bounds(
+                base_layers, frame_index, matrix, _depth=_depth + 1
+            )
+            mask_bounds = self._compute_plain_group_bounds(
+                [clip_layer], frame_index, matrix, _depth=_depth
+            )
+            group_bounds = _intersect_bounds(base_bounds, mask_bounds)
+            combined = _union_bounds(combined, group_bounds)
+
+        return combined
+
+    def _compute_plain_group_bounds(
+        self,
+        layers: List[dict],
+        frame_index: int,
+        matrix: TransformMatrix,
+        _depth: int = 0,
+    ) -> Optional[Tuple[int, int, int, int]]:
+        combined: Optional[Tuple[int, int, int, int]] = None
+
+        for layer in layers:
             frames = layer.get("FR", [])
             frame = self._find_frame(frames, frame_index)
             if frame is None:
@@ -1050,7 +1118,10 @@ class Symbols:
                     )
                     transform = TransformMatrix.parse(instance.get("M3D", IDENTITY_M3D))
                     child_bounds = self._compute_bounds(
-                        element_name, instance_frame, matrix @ transform
+                        element_name,
+                        instance_frame,
+                        matrix @ transform,
+                        _depth=_depth + 1,
                     )
                     combined = _union_bounds(combined, child_bounds)
                 elif "ASI" in element:
@@ -1093,100 +1164,156 @@ class Symbols:
             math.ceil(float(max(corners[1]))),
         )
 
-    def _render_symbol(self, canvas, name, frame_index, matrix, color):
-        canvas_stack = []
-        for layer in reversed(self.timelines.get(name, [])):
-            frames = layer.get("FR", [])
-            frame = self._find_frame(frames, frame_index)
-            if frame is None:
+    @staticmethod
+    def _group_clip_layers(layers: List[dict]) -> List[List[dict]]:
+        groups: List[List[dict]] = []
+        current: List[dict] = []
+        for layer in layers:
+            current.append(layer)
+            if layer.get("LT") == "Clp":
+                groups.append(current)
+                current = []
+        if current:
+            groups.append(current)
+        return groups
+
+    def _render_single_layer(
+        self, canvas, layer, frame_index, matrix, color, canvas_size
+    ):
+        frames = layer.get("FR", [])
+        frame = self._find_frame(frames, frame_index)
+        if frame is None:
+            return
+        for element in frame.get("E", []):
+            if "SI" in element:
+                instance = element["SI"]
+                element_name = instance.get("SN")
+                if not element_name:
+                    continue
+                instance_frame = self._resolve_instance_frame(
+                    element_name, instance, frame["I"], frame_index
+                )
+                element_color = (
+                    color @ ColorEffect.parse(instance["C"])
+                    if "C" in instance
+                    else color
+                )
+                transform = TransformMatrix.parse(instance.get("M3D", IDENTITY_M3D))
+                self._render_symbol(
+                    canvas,
+                    element_name,
+                    instance_frame,
+                    matrix @ transform,
+                    element_color,
+                    canvas_size,
+                )
+            else:
+                atlas_instance = element.get("ASI", {})
+                sprite_name = atlas_instance.get("N")
+                if not sprite_name:
+                    continue
+                transform = TransformMatrix.parse(
+                    atlas_instance.get("M3D", IDENTITY_M3D)
+                )
+                result = self.sprite_atlas.get_sprite(
+                    sprite_name,
+                    matrix @ transform,
+                    color,
+                    canvas_size[0],
+                    canvas_size[1],
+                )
+                if result is None:
+                    continue
+                sprite, dest = result
+                if sprite is None:
+                    continue
+                canvas.alpha_composite(sprite, dest=dest)
+
+    def _render_layer_group(
+        self,
+        canvas,
+        layers,
+        frame_index,
+        matrix,
+        color,
+        canvas_size,
+        context: str = "",
+        _depth: int = 0,
+    ):
+        if _depth > 32:
+            warnings.warn("Clip nesting exceeded 32 levels; aborting recursion.")
+            return
+
+        for group in self._group_clip_layers(layers):
+            clip_layer = group[-1] if group[-1].get("LT") == "Clp" else None
+            base_layers = group[:-1] if clip_layer is not None else group
+
+            if clip_layer is None:
+                for layer in base_layers:
+                    self._render_single_layer(
+                        canvas, layer, frame_index, matrix, color, canvas_size
+                    )
                 continue
 
-            if (layer.get("Clpb") and not canvas_stack) or layer.get("LT") == "Clp":
-                canvas_stack.append(canvas)
-                canvas = Image.new("RGBA", self.canvas_size, color=(0, 0, 0, 0))
+            if not base_layers:
+                warnings.warn(
+                    f"Clipping layer `{clip_layer.get('LN')}`{context} has no "
+                    f"base layer; skipping."
+                )
+                continue
 
-            for element in frame.get("E", []):
-                if "SI" in element:
-                    instance = element["SI"]
-                    element_name = instance.get("SN")
-                    if not element_name:
-                        continue
-                    instance_frame = self._resolve_instance_frame(
-                        element_name,
-                        instance,
-                        frame["I"],
-                        frame_index,
-                    )
-                    element_color = (
-                        color @ ColorEffect.parse(instance["C"])
-                        if "C" in instance
-                        else color
-                    )
-                    transform = TransformMatrix.parse(instance.get("M3D", IDENTITY_M3D))
-                    self._render_symbol(
-                        canvas,
-                        element_name,
-                        instance_frame,
-                        matrix @ transform,
-                        element_color,
-                    )
-                else:
-                    atlas_instance = element.get("ASI", {})
-                    sprite_name = atlas_instance.get("N")
-                    transform = TransformMatrix.parse(
-                        atlas_instance.get("M3D", IDENTITY_M3D)
-                    )
-                    sprite, dest = self.sprite_atlas.get_sprite(
-                        sprite_name, matrix @ transform, color
-                    )
-                    if sprite is not None:
-                        canvas.alpha_composite(sprite, dest=dest)
+            nested_base = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
+            self._render_layer_group(
+                nested_base,
+                base_layers,
+                frame_index,
+                matrix,
+                color,
+                canvas_size,
+                context=context,
+                _depth=_depth + 1,
+            )
 
-            if layer.get("LT") == "Clp":
-                if len(canvas_stack) < 2:
-                    warnings.warn(
-                        f"Clipping layer `{layer.get('LN')}` in symbol "
-                        f"`{name}` has no base layer to mask; skipping mask."
-                    )
-                    if canvas_stack:
-                        canvas = canvas_stack.pop()
-                    continue
+            nested_mask = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
+            self._render_single_layer(
+                nested_mask, clip_layer, frame_index, matrix, color, canvas_size
+            )
 
-                mask_canvas = canvas
-                masked_canvas = canvas_stack.pop()
-                base_canvas = canvas_stack.pop()
+            mask_bbox = nested_mask.getbbox()
+            if mask_bbox is None:
+                warnings.warn(
+                    f"Mask `{clip_layer.get('LN')}`{context} is fully "
+                    f"transparent; dropping group."
+                )
+                continue
 
-                mask_bbox = mask_canvas.getbbox()
-                if mask_bbox is None:
-                    warnings.warn(
-                        f"Mask `{layer.get('LN')}` in symbol `{name}` is fully transparent"
-                    )
-                    base_canvas.alpha_composite(masked_canvas)
-                else:
-                    mask_canvas = mask_canvas.crop(mask_bbox)
-                    masked_canvas = masked_canvas.crop(mask_bbox)
-                    masked_alpha = masked_canvas.getchannel("A")
+            nested_base = nested_base.crop(mask_bbox)
+            nested_mask = nested_mask.crop(mask_bbox)
+            masked_alpha = nested_base.getchannel("A")
+            mask_alpha = nested_mask.getchannel("A")
 
-                    mask_alpha = np.array(mask_canvas.getchannel("A"))
-                    max_mask = np.max(mask_alpha)
-                    if max_mask > 0:
-                        mask_alpha = mask_alpha / max_mask * 255
-                    mask_alpha_arr = mask_alpha.clip(0, 255).astype("uint8")
-                    try:
-                        mask_alpha = Image.fromarray(mask_alpha_arr, "L")
-                    except TypeError:
-                        h, w = mask_alpha_arr.shape[:2]
-                        mask_alpha = Image.frombytes(
-                            "L",
-                            (w, h),
-                            np.ascontiguousarray(mask_alpha_arr).tobytes(),
-                        )
-                    masked_canvas.putalpha(
-                        ImageChops.multiply(masked_alpha, mask_alpha)
-                    )
-                    base_canvas.alpha_composite(masked_canvas, dest=mask_bbox[:2])
+            mask_arr = np.array(mask_alpha)
+            max_mask = int(mask_arr.max())
+            if max_mask > 0:
+                mask_arr = mask_arr / max_mask * 255
+            mask_alpha = Image.fromarray(mask_arr.clip(0, 255).astype("uint8"), "L")
+            nested_base.putalpha(ImageChops.multiply(masked_alpha, mask_alpha))
+            canvas.alpha_composite(nested_base, dest=mask_bbox[:2])
 
-                canvas = base_canvas
+    def _render_symbol(self, canvas, name, frame_index, matrix, color, canvas_size):
+        layers = list(reversed(self.timelines.get(name, [])))
+        if not layers:
+            return
+        context = f" in symbol `{name}`" if name else ""
+        self._render_layer_group(
+            canvas,
+            layers,
+            frame_index,
+            matrix,
+            color,
+            canvas_size,
+            context=context,
+        )
 
     def _resolve_instance_frame(
         self,
@@ -1203,24 +1330,23 @@ class Symbols:
         first_frame = max(0, min(first_frame, symbol_length - 1))
 
         symbol_type = (instance.get("ST") or "G").upper()
-        if symbol_type == "MC":
-            return first_frame
-
-        offset = max(0, parent_frame_index - frame_start)
-
         loop_mode = instance.get("LP") or "LP"
-        if isinstance(loop_mode, str):
-            loop_mode = loop_mode.upper()
-        else:
-            loop_mode = "LP"
+        loop_mode = loop_mode.upper() if isinstance(loop_mode, str) else "LP"
 
         if loop_mode == "SF":
             return first_frame
 
+        if symbol_type == "MC" and not self.animate_movie_clips:
+            return first_frame
+
+        if symbol_type == "MC":
+            offset = parent_frame_index
+        else:
+            offset = max(0, parent_frame_index - frame_start)
+
         target = first_frame + offset
         if loop_mode == "PO":
             return min(target, symbol_length - 1)
-
         return target % symbol_length
 
     @staticmethod
@@ -1379,30 +1505,22 @@ def _infer_canvas_size(animation_json, spritemap_json, atlas_size):
     for symbol_name in timelines.keys():
         symbol_bounds(symbol_name)
 
-    max_abs_x = 0.0
-    max_abs_y = 0.0
-    for bounds in bounds_cache.values():
-        if not bounds:
-            continue
-        min_x, min_y, max_x, max_y = bounds
-        max_abs_x = max(max_abs_x, abs(min_x), abs(max_x))
-        max_abs_y = max(max_abs_y, abs(min_y), abs(max_y))
+    all_bounds = [b for b in bounds_cache.values() if b]
 
-    if max_abs_x == 0 and max_abs_y == 0:
+    if not all_bounds:
         return atlas_size
 
-    padding = 32.0
-    inferred_width = int(math.ceil(max_abs_x * 2.0 + padding))
-    inferred_height = int(math.ceil(max_abs_y * 2.0 + padding))
+    min_x = min(b[0] for b in all_bounds)
+    min_y = min(b[1] for b in all_bounds)
+    max_x = max(b[2] for b in all_bounds)
+    max_y = max(b[3] for b in all_bounds)
 
-    MAX_CANVAS_DIM = 16384
-    if inferred_width > MAX_CANVAS_DIM or inferred_height > MAX_CANVAS_DIM:
-        warnings.warn(
-            f"Inferred canvas size ({inferred_width}x{inferred_height}) exceeds "
-            f"the {MAX_CANVAS_DIM}px safety cap; clamping."
-        )
-        inferred_width = min(inferred_width, MAX_CANVAS_DIM)
-        inferred_height = min(inferred_height, MAX_CANVAS_DIM)
+    span_x = max(abs(min_x), abs(max_x)) * 2.0
+    span_y = max(abs(min_y), abs(max_y)) * 2.0
+
+    padding = 32.0
+    inferred_width = int(math.ceil(span_x + padding))
+    inferred_height = int(math.ceil(span_y + padding))
 
     return (
         max(atlas_size[0], inferred_width),
@@ -1421,6 +1539,7 @@ class AdobeSpritemapRenderer:
         filter_single_frame: bool = True,
         filter_unused_symbols: bool = False,
         root_animation_only: bool = False,
+        animate_movie_clips: bool = True,
     ):
         self.animation_path = animation_path
         self.spritemap_json_path = spritemap_json_path
@@ -1446,11 +1565,9 @@ class AdobeSpritemapRenderer:
             self.filter_single_frame = filter_single_frame
             self.filter_unused_symbols = filter_unused_symbols
             self.root_animation_only = root_animation_only
+            self.animate_movie_clips = animate_movie_clips
 
-            direct_children = collect_direct_child_symbols(self.animation_json)
-            if direct_children:
-                self._referenced_symbols = direct_children
-            elif filter_unused_symbols:
+            if filter_unused_symbols:
                 self._referenced_symbols = collect_referenced_symbols(
                     self.animation_json
                 )
@@ -1460,7 +1577,12 @@ class AdobeSpritemapRenderer:
             self.sprite_atlas = SpriteAtlas(
                 spritemap_json, atlas_image, canvas_size, resample
             )
-            self.symbols = Symbols(self.animation_json, self.sprite_atlas, canvas_size)
+            self.symbols = Symbols(
+                self.animation_json,
+                self.sprite_atlas,
+                canvas_size,
+                animate_movie_clips=animate_movie_clips,
+            )
         finally:
             atlas_image.close()
 
@@ -1732,6 +1854,7 @@ class AdobeSpritemapRenderer:
                 pass
             finally:
                 self.symbols = None
+                self._referenced_symbols = None
 
         if getattr(self, "sprite_atlas", None):
             try:

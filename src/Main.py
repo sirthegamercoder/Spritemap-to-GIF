@@ -2,13 +2,16 @@ import json
 import os
 import sys
 import threading
+import ctypes
+from ctypes import wintypes
 from pathlib import Path
 from tkinter import filedialog, messagebox
 from typing import Callable, Optional
 
 import customtkinter as ctk
-from PIL import Image
+from PIL import Image, ImageTk
 from tkinterdnd2 import DND_FILES, TkinterDnD
+from tkinter_icons import FluentRegularIcon
 
 from core.renderer import AdobeSpritemapRenderer
 
@@ -21,6 +24,24 @@ _RESERVED_NAMES = {
     *(f"COM{i}" for i in range(1, 10)),
     *(f"LPT{i}" for i in range(1, 10)),
 }
+
+ICON_COLOR = "#DCE4EE"
+ICON_COLOR_MUTED = "#9AA4AF"
+ICON_SIZE = 18
+ICON_SIZE_SMALL = 16
+ICON_SIZE_LARGE = 20
+
+
+def _icon(name: str, size: int = ICON_SIZE, color: str = ICON_COLOR):
+    try:
+        tk_img = FluentRegularIcon(name, size=size, color=color).image
+        pil_img = ImageTk.getimage(tk_img).convert("RGBA")
+        return ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(size, size))
+    except Exception as exc:
+        print(
+            f"[tkiner-icons] WARNING: could not load '{name}': {exc}", file=sys.stderr
+        )
+        return None
 
 
 def resource_path(relative_path):
@@ -125,6 +146,7 @@ class ExportWorker(threading.Thread):
         filter_unused_symbols,
         root_animation_only,
         use_source_fps,
+        animate_movie_clips,
         on_progress: Callable,
         on_log: Callable,
         on_finished: Callable,
@@ -142,14 +164,19 @@ class ExportWorker(threading.Thread):
         self.filter_unused_symbols = filter_unused_symbols
         self.root_animation_only = root_animation_only
         self.use_source_fps = use_source_fps
+        self.animate_movie_clips = animate_movie_clips
         self.on_progress = on_progress
         self.on_log = on_log
         self.on_finished = on_finished
         self.on_error = on_error
         self._cancel = False
+        self._done = threading.Event()
 
     def cancel(self):
         self._cancel = True
+
+    def wait(self, timeout: Optional[float] = None) -> bool:
+        return self._done.wait(timeout)
 
     def run(self):
         renderer = None
@@ -163,6 +190,7 @@ class ExportWorker(threading.Thread):
                     filter_single_frame=self.filter_single_frame,
                     filter_unused_symbols=self.filter_unused_symbols,
                     root_animation_only=self.root_animation_only,
+                    animate_movie_clips=self.animate_movie_clips,
                 )
             except json.JSONDecodeError as exc:
                 self.on_error(f"Invalid JSON: {exc}")
@@ -262,6 +290,7 @@ class ExportWorker(threading.Thread):
         finally:
             if renderer is not None:
                 renderer.close()
+            self._done.set()
 
 
 class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
@@ -273,9 +302,8 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
         self.title("Spritemap to GIF")
         self.wm_iconbitmap(resource_path("icon.ico"))
 
-        self._window_size = (750, 770)
-        self.minsize(750, 700)
-        self.geometry(f"{self._window_size[0]}x{self._window_size[1]}")
+        self._preferred_size = (750, 770)
+        self._min_size = (620, 480)
 
         self.worker: Optional[ExportWorker] = None
         self._last_output_dir: Optional[Path] = None
@@ -283,35 +311,87 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
+        self._icons = {
+            "input": _icon("ic-fluent-document-24-regular", ICON_SIZE, ICON_COLOR),
+            "output": _icon("ic-fluent-folder-24-regular", ICON_SIZE, ICON_COLOR),
+            "settings": _icon("ic-fluent-settings-24-regular", ICON_SIZE, ICON_COLOR),
+            "options": _icon("ic-fluent-options-24-regular", ICON_SIZE, ICON_COLOR),
+            "browse": _icon(
+                "ic-fluent-folder-open-24-regular", ICON_SIZE_SMALL, ICON_COLOR_MUTED
+            ),
+            "export": _icon(
+                "ic-fluent-arrow-export-up-24-regular", ICON_SIZE_LARGE, "#FFFFFF"
+            ),
+            "cancel": _icon(
+                "ic-fluent-record-stop-24-regular", ICON_SIZE_LARGE, "#FFFFFF"
+            ),
+            "open": _icon(
+                "ic-fluent-folder-open-24-regular", ICON_SIZE_LARGE, "#FFFFFF"
+            ),
+        }
+
         self._build_ui()
-        self._center_window()
+        self._fit_to_screen()
 
-    def _center_window(self):
-        self.update_idletasks()
-        w, h = self._window_size
-
+    def _get_usable_screen_area(self):
         sw = self.winfo_screenwidth()
         sh = self.winfo_screenheight()
 
-        usable_h = sh - 80
-        if h > usable_h:
-            h = usable_h
+        try:
+            rect = wintypes.RECT()
+            SPI_GETWORKAREA = 0x0030
 
-        x = max(0, (sw - w) // 2)
-        y = max(0, (sh - h) // 2 - 20)
+            if ctypes.windll.user32.SystemParametersInfoW(
+                SPI_GETWORKAREA, 0, ctypes.byref(rect), 0
+            ):
+                return (
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                )
+        except Exception:
+            pass
 
-        self.geometry(f"{w}x{h}+{x}+{y}")
+        return (0, 0, sw, sh)
+
+    def _fit_to_screen(self):
+        self.update_idletasks()
+
+        work_x, work_y, work_w, work_h = self._get_usable_screen_area()
+
+        margin = 24
+        max_w = max(200, work_w - margin * 2)
+        max_h = max(200, work_h - margin * 2)
+
+        pref_w, pref_h = self._preferred_size
+        width = min(pref_w, max_w)
+        height = min(pref_h, max_h)
+
+        min_w = min(self._min_size[0], max_w)
+        min_h = min(self._min_size[1], max_h)
+        self.minsize(min_w, min_h)
+
+        x = work_x + max(0, (work_w - width) // 2)
+        y = work_y + max(0, (work_h - height) // 2)
+
+        self.geometry(f"{width}x{height}+{x}+{y}")
 
     def _build_ui(self):
+        self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(0, weight=1)
 
-        files_frame = ctk.CTkFrame(self)
+        self.scroll_frame = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        self.scroll_frame.grid(row=0, column=0, sticky="nsew")
+        self.scroll_frame.grid_columnconfigure(0, weight=1)
+
+        files_frame = ctk.CTkFrame(self.scroll_frame)
         files_frame.grid(row=0, column=0, padx=16, pady=(16, 8), sticky="ew")
         files_frame.grid_columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(
-            files_frame, text="📄 Input Files", font=ctk.CTkFont(size=14, weight="bold")
-        ).grid(row=0, column=0, columnspan=3, padx=10, pady=(10, 6), sticky="w")
+        self._section_label(files_frame, "Input Files", "input").grid(
+            row=0, column=0, columnspan=3, padx=10, pady=(10, 6), sticky="w"
+        )
 
         self.animation_entry = self._add_file_row(
             files_frame, 1, "Animation JSON:", "animation.json (drag & drop)", ".json"
@@ -323,13 +403,13 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
             files_frame, 3, "Spritemap PNG:", "spritemap.png (drag & drop)", ".png"
         )
 
-        output_frame = ctk.CTkFrame(self)
+        output_frame = ctk.CTkFrame(self.scroll_frame)
         output_frame.grid(row=1, column=0, padx=16, pady=8, sticky="ew")
         output_frame.grid_columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(
-            output_frame, text="📁 Output", font=ctk.CTkFont(size=14, weight="bold")
-        ).grid(row=0, column=0, columnspan=3, padx=10, pady=(10, 6), sticky="w")
+        self._section_label(output_frame, "Output", "output").grid(
+            row=0, column=0, columnspan=3, padx=10, pady=(10, 6), sticky="w"
+        )
 
         ctk.CTkLabel(output_frame, text="Output Folder:", anchor="e", width=120).grid(
             row=1, column=0, padx=(10, 6), pady=6, sticky="e"
@@ -340,19 +420,17 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
             placeholder_text="Drop folder here or choose...",
         )
         self.output_entry.grid(row=1, column=1, padx=6, pady=6, sticky="ew")
-        ctk.CTkButton(
-            output_frame, text="📂", width=40, command=self._pick_output
-        ).grid(row=1, column=2, padx=(6, 10), pady=6)
+        self._browse_button(output_frame, self._pick_output).grid(
+            row=1, column=2, padx=(6, 10), pady=6
+        )
 
-        settings_frame = ctk.CTkFrame(self)
+        settings_frame = ctk.CTkFrame(self.scroll_frame)
         settings_frame.grid(row=2, column=0, padx=16, pady=8, sticky="ew")
         settings_frame.grid_columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(
-            settings_frame,
-            text="⚙️ GIF Settings",
-            font=ctk.CTkFont(size=14, weight="bold"),
-        ).grid(row=0, column=0, columnspan=2, padx=10, pady=(10, 6), sticky="w")
+        self._section_label(settings_frame, "GIF Settings", "settings").grid(
+            row=0, column=0, columnspan=2, padx=10, pady=(10, 6), sticky="w"
+        )
 
         ctk.CTkLabel(
             settings_frame, text="Frame Duration:", anchor="e", width=120
@@ -408,15 +486,13 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
         )
         self.disposal_combo.grid(row=4, column=1, padx=6, pady=6, sticky="w")
 
-        options_frame = ctk.CTkFrame(self)
+        options_frame = ctk.CTkFrame(self.scroll_frame)
         options_frame.grid(row=3, column=0, padx=16, pady=8, sticky="ew")
         options_frame.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(
-            options_frame,
-            text="🔧 Export Options",
-            font=ctk.CTkFont(size=14, weight="bold"),
-        ).grid(row=0, column=0, padx=10, pady=(10, 6), sticky="w")
+        self._section_label(options_frame, "Export Options", "options").grid(
+            row=0, column=0, padx=10, pady=(10, 6), sticky="w"
+        )
 
         self.filter_single_var = ctk.BooleanVar(value=True)
         self.filter_single_check = ctk.CTkCheckBox(
@@ -436,9 +512,17 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
         self.root_only_check = ctk.CTkCheckBox(
             options_frame, text="Root animation only", variable=self.root_only_var
         )
-        self.root_only_check.grid(row=3, column=0, padx=10, pady=(4, 10), sticky="w")
+        self.root_only_check.grid(row=3, column=0, padx=10, pady=4, sticky="w")
 
-        button_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.animate_mc_var = ctk.BooleanVar(value=True)
+        self.animate_mc_check = ctk.CTkCheckBox(
+            options_frame,
+            text="Animate movie clips",
+            variable=self.animate_mc_var,
+        )
+        self.animate_mc_check.grid(row=4, column=0, padx=10, pady=(4, 10), sticky="w")
+
+        button_frame = ctk.CTkFrame(self.scroll_frame, fg_color="transparent")
         button_frame.grid(row=4, column=0, padx=16, pady=8, sticky="ew")
         button_frame.grid_columnconfigure(0, weight=2)
         button_frame.grid_columnconfigure(1, weight=1)
@@ -446,7 +530,9 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
 
         self.export_button = ctk.CTkButton(
             button_frame,
-            text="▶  Export GIFs",
+            text="  Export GIFs",
+            image=self._icons.get("export"),
+            compound="left",
             height=40,
             font=ctk.CTkFont(size=14, weight="bold"),
             command=self._start_export,
@@ -455,7 +541,9 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
 
         self.cancel_button = ctk.CTkButton(
             button_frame,
-            text="⏹  Cancel",
+            text="  Cancel",
+            image=self._icons.get("cancel"),
+            compound="left",
             height=40,
             state="disabled",
             fg_color="#B71C1C",
@@ -466,7 +554,9 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
 
         self.open_folder_button = ctk.CTkButton(
             button_frame,
-            text="📂  Open Output",
+            text="  Open Output",
+            image=self._icons.get("open"),
+            compound="left",
             height=40,
             state="disabled",
             fg_color="#37474F",
@@ -475,11 +565,29 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
         )
         self.open_folder_button.grid(row=0, column=2, padx=(6, 0), sticky="ew")
 
-        self.progress_bar = ctk.CTkProgressBar(self)
+        self.progress_bar = ctk.CTkProgressBar(self.scroll_frame)
         self.progress_bar.grid(row=5, column=0, padx=16, pady=(8, 4), sticky="ew")
         self.progress_bar.set(0)
-        self.progress_label = ctk.CTkLabel(self, text="Ready", anchor="w")
+        self.progress_label = ctk.CTkLabel(self.scroll_frame, text="Ready", anchor="w")
         self.progress_label.grid(row=6, column=0, padx=16, pady=(0, 16), sticky="ew")
+
+    def _section_label(self, parent, text: str, icon_key: str) -> ctk.CTkLabel:
+        return ctk.CTkLabel(
+            parent,
+            text=f"  {text}",
+            image=self._icons.get(icon_key),
+            compound="left",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        )
+
+    def _browse_button(self, parent, command) -> ctk.CTkButton:
+        return ctk.CTkButton(
+            parent,
+            text="",
+            image=self._icons.get("browse"),
+            width=40,
+            command=command,
+        )
 
     def _add_file_row(self, parent, row, label, placeholder, ext):
         ctk.CTkLabel(parent, text=label, anchor="e", width=120).grid(
@@ -489,9 +597,9 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
             parent, file_mode="file", extensions=(ext,), placeholder_text=placeholder
         )
         entry.grid(row=row, column=1, padx=6, pady=6, sticky="ew")
-        ctk.CTkButton(
-            parent, text="📂", width=40, command=lambda: self._pick_file(entry, ext)
-        ).grid(row=row, column=2, padx=(6, 10), pady=6)
+        self._browse_button(parent, lambda: self._pick_file(entry, ext)).grid(
+            row=row, column=2, padx=(6, 10), pady=6
+        )
         return entry
 
     def _toggle_duration(self):
@@ -519,6 +627,8 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
             self.output_entry.insert(0, path)
 
     def _ui(self, func, *args):
+        if getattr(self, "_closing", False):
+            return
         self.after(0, func, *args)
 
     def _log(self, message: str):
@@ -544,7 +654,6 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
                 if p.is_dir():
                     self._last_output_dir = p
                     self.open_folder_button.configure(state="normal")
-            self.worker = None
             title = "Export Complete"
             if "cancelled" in message.lower():
                 title = "Export Cancelled"
@@ -556,7 +665,6 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
         def update():
             self._set_exporting(False)
             self.progress_label.configure(text="Error")
-            self.worker = None
             fallback = self.output_entry.get().strip()
             if fallback:
                 p = Path(fallback)
@@ -568,6 +676,9 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
         self._ui(update)
 
     def _start_export(self):
+        if self.worker is not None:
+            self.worker.wait(timeout=2.0)
+            self.worker = None
         animation_path = Path(self.animation_entry.get().strip())
         spritemap_path = Path(self.spritemap_entry.get().strip())
         atlas_path = Path(self.atlas_entry.get().strip())
@@ -649,6 +760,7 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
             filter_unused_symbols=self.filter_unused_var.get(),
             root_animation_only=self.root_only_var.get(),
             use_source_fps=self.use_source_fps_var.get(),
+            animate_movie_clips=self.animate_mc_var.get(),
             on_progress=self._on_progress,
             on_log=self._on_log,
             on_finished=self._on_finished,
@@ -692,6 +804,7 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
             self.filter_single_check,
             self.filter_unused_check,
             self.root_only_check,
+            self.animate_mc_check,
         ):
             try:
                 widget.configure(state=state)
@@ -705,6 +818,7 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
             self.duration_entry.configure(state="disabled")
 
     def on_close(self):
+        self._closing = True
         if self.worker is not None and self.worker.is_alive():
             self.worker.cancel()
         self.destroy()
