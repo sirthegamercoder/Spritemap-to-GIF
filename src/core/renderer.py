@@ -812,7 +812,13 @@ class SpriteAtlas:
     def get_sprite(self, name, matrix, color, canvas_width, canvas_height):
         cache_key = None
         if matrix is not None and color is not None:
-            cache_key = (name, matrix.bytes(), hash(color))
+            cache_key = (
+                name,
+                matrix.bytes(),
+                hash(color),
+                canvas_width,
+                canvas_height,
+            )
             cached = self._composed_cache.get(cache_key)
             if cached is not None:
                 self._composed_cache.move_to_end(cache_key)
@@ -901,6 +907,8 @@ class SpriteAtlas:
                 except Exception:
                     pass
             self._composed_cache.clear()
+
+        if getattr(self, "_warned_oob", None) is not None:
             self._warned_oob.clear()
 
         if getattr(self, "img", None) is not None:
@@ -960,7 +968,10 @@ class Symbols:
         for symbol in animation_json.get("SD", {}).get("S", []):
             name = symbol.get("SN")
             if name in self.timelines:
-                raise ValueError(f"Symbol `{name}` is not unique")
+                warnings.warn(
+                    f"Symbol `{name}` is not unique; later definition overrides "
+                    f"earlier one."
+                )
             self.timelines[name] = symbol.get("TL", {}).get("L", [])
 
         self.timelines[None] = animation_json.get("AN", {}).get("TL", {}).get("L", [])
@@ -1065,6 +1076,9 @@ class Symbols:
         matrix: TransformMatrix,
         _depth: int = 0,
     ) -> Optional[Tuple[int, int, int, int]]:
+        if _depth > 32:
+            return None
+
         combined: Optional[Tuple[int, int, int, int]] = None
 
         for group in self._group_clip_layers(layers):
@@ -1340,6 +1354,8 @@ class Symbols:
             return first_frame
 
         if symbol_type == "MC":
+            # Movie clips move in sync with their parent's timeline (regardless of the parent's frame_start value).
+            # This is different from Graphic symbols, whose position shifts from the frame in which their instance appears.
             offset = parent_frame_index
         else:
             offset = max(0, parent_frame_index - frame_start)
@@ -1521,6 +1537,15 @@ def _infer_canvas_size(animation_json, spritemap_json, atlas_size):
     padding = 32.0
     inferred_width = int(math.ceil(span_x + padding))
     inferred_height = int(math.ceil(span_y + padding))
+
+    MAX_CANVAS_DIM = 16384
+    if inferred_width > MAX_CANVAS_DIM or inferred_height > MAX_CANVAS_DIM:
+        warnings.warn(
+            f"Inferred canvas size ({inferred_width}x{inferred_height}) exceeds "
+            f"the {MAX_CANVAS_DIM}px safety cap; clamping."
+        )
+        inferred_width = min(inferred_width, MAX_CANVAS_DIM)
+        inferred_height = min(inferred_height, MAX_CANVAS_DIM)
 
     return (
         max(atlas_size[0], inferred_width),
@@ -1854,7 +1879,8 @@ class AdobeSpritemapRenderer:
                 pass
             finally:
                 self.symbols = None
-                self._referenced_symbols = None
+
+        self._referenced_symbols = None
 
         if getattr(self, "sprite_atlas", None):
             try:

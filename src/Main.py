@@ -3,8 +3,15 @@ import os
 import sys
 import threading
 import ctypes
-from ctypes import wintypes
 from pathlib import Path
+
+try:
+    from ctypes import wintypes
+
+    _HAS_WINTYPES = True
+except Exception:
+    wintypes = None
+    _HAS_WINTYPES = False
 from tkinter import filedialog, messagebox
 from typing import Callable, Optional
 
@@ -39,7 +46,7 @@ def _icon(name: str, size: int = ICON_SIZE, color: str = ICON_COLOR):
         return ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(size, size))
     except Exception as exc:
         print(
-            f"[tkiner-icons] WARNING: could not load '{name}': {exc}", file=sys.stderr
+            f"[tkinter-icons] WARNING: could not load '{name}': {exc}", file=sys.stderr
         )
         return None
 
@@ -307,6 +314,7 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
 
         self.worker: Optional[ExportWorker] = None
         self._last_output_dir: Optional[Path] = None
+        self._closing = False
 
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
@@ -337,21 +345,22 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
         sw = self.winfo_screenwidth()
         sh = self.winfo_screenheight()
 
-        try:
-            rect = wintypes.RECT()
-            SPI_GETWORKAREA = 0x0030
+        if _HAS_WINTYPES:
+            try:
+                rect = wintypes.RECT()
+                SPI_GETWORKAREA = 0x0030
 
-            if ctypes.windll.user32.SystemParametersInfoW(
-                SPI_GETWORKAREA, 0, ctypes.byref(rect), 0
-            ):
-                return (
-                    rect.left,
-                    rect.top,
-                    rect.right - rect.left,
-                    rect.bottom - rect.top,
-                )
-        except Exception:
-            pass
+                if ctypes.windll.user32.SystemParametersInfoW(
+                    SPI_GETWORKAREA, 0, ctypes.byref(rect), 0
+                ):
+                    return (
+                        rect.left,
+                        rect.top,
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                    )
+            except Exception:
+                pass
 
         return (0, 0, sw, sh)
 
@@ -629,7 +638,10 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
     def _ui(self, func, *args):
         if getattr(self, "_closing", False):
             return
-        self.after(0, func, *args)
+        try:
+            self.after(0, func, *args)
+        except Exception:
+            pass
 
     def _log(self, message: str):
         print(f"[AdobeSpritemapRenderer] {message}")
@@ -677,7 +689,13 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _start_export(self):
         if self.worker is not None:
-            self.worker.wait(timeout=2.0)
+            if not self.worker.wait(timeout=2.0):
+                messagebox.showwarning(
+                    "Export In Progress",
+                    "The previous export is still running. Please wait for it "
+                    "to finish or cancel it before starting a new one.",
+                )
+                return
             self.worker = None
         animation_path = Path(self.animation_entry.get().strip())
         spritemap_path = Path(self.spritemap_entry.get().strip())
