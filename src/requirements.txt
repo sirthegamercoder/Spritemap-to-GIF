@@ -1,4 +1,5 @@
-customtkinter 
+customtkinter
+CTkMessagebox 
 tkinterdnd2
 tkinter-icons[fluent-regular] 
 pillow

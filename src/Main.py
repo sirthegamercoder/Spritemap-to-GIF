@@ -12,13 +12,15 @@ try:
 except Exception:
     wintypes = None
     _HAS_WINTYPES = False
-from tkinter import filedialog, messagebox
+from tkinter import filedialog
 from typing import Callable, Optional
 
 import customtkinter as ctk
 from PIL import Image, ImageTk
 from tkinterdnd2 import DND_FILES, TkinterDnD
 from tkinter_icons import FluentRegularIcon
+
+from CTkMessagebox import CTkMessagebox
 
 from core.renderer import AdobeSpritemapRenderer
 
@@ -102,6 +104,26 @@ def validate_animation_json(path: Path) -> None:
         raise ValueError(f"{path.name} must contain a JSON object at the top level.")
 
 
+def classify_json_file(path: Path) -> Optional[str]:
+    try:
+        with path.open("r", encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            if "ATLAS" in data:
+                return "spritemap"
+            if "TIMELINE" in data:
+                return "animation"
+    except Exception:
+        pass
+
+    name = path.name.lower()
+    if "spritemap" in name:
+        return "spritemap"
+    if "animation" in name or "anims" in name:
+        return "animation"
+    return None
+
+
 class DropEntry(ctk.CTkEntry):
     def __init__(self, master, file_mode="file", extensions=(), **kwargs):
         super().__init__(master, **kwargs)
@@ -136,6 +158,7 @@ class DropEntry(ctk.CTkEntry):
         if len(paths) == 1 and self._is_valid_path(paths[0]):
             self.delete(0, "end")
             self.insert(0, paths[0])
+            return "break"
         return getattr(event, "action", None)
 
 
@@ -403,14 +426,16 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
         )
 
         self.animation_entry = self._add_file_row(
-            files_frame, 1, "Animation JSON:", "animation.json (drag & drop)", ".json"
+            files_frame, 2, "Animation JSON:", "animation.json (drag & drop)", ".json"
         )
         self.spritemap_entry = self._add_file_row(
-            files_frame, 2, "Spritemap JSON:", "spritemap.json (drag & drop)", ".json"
+            files_frame, 3, "Spritemap JSON:", "spritemap.json (drag & drop)", ".json"
         )
         self.atlas_entry = self._add_file_row(
-            files_frame, 3, "Spritemap PNG:", "spritemap.png (drag & drop)", ".png"
+            files_frame, 4, "Spritemap PNG:", "spritemap.png (drag & drop)", ".png"
         )
+
+        self._register_drop_recursive(files_frame, self._on_files_drop)
 
         output_frame = ctk.CTkFrame(self.scroll_frame)
         output_frame.grid(row=1, column=0, padx=16, pady=8, sticky="ew")
@@ -580,6 +605,30 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
         self.progress_label = ctk.CTkLabel(self.scroll_frame, text="Ready", anchor="w")
         self.progress_label.grid(row=6, column=0, padx=16, pady=(0, 16), sticky="ew")
 
+    def _register_drop_recursive(self, widget, handler):
+        if not isinstance(widget, DropEntry):
+            try:
+                widget.drop_target_register(DND_FILES)
+                widget.dnd_bind("<<Drop>>", handler)
+            except Exception:
+                pass
+
+            for attr in ("_canvas", "_canvas_2"):
+                inner = getattr(widget, attr, None)
+                if inner is not None:
+                    try:
+                        inner.drop_target_register(DND_FILES)
+                        inner.dnd_bind("<<Drop>>", handler)
+                    except Exception:
+                        pass
+
+        try:
+            children = widget.winfo_children()
+        except Exception:
+            children = []
+        for child in children:
+            self._register_drop_recursive(child, handler)
+
     def _section_label(self, parent, text: str, icon_key: str) -> ctk.CTkLabel:
         return ctk.CTkLabel(
             parent,
@@ -611,6 +660,72 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
         )
         return entry
 
+    def _classify_dropped_file(self, path: str) -> Optional[str]:
+        try:
+            p = Path(path)
+        except Exception:
+            return None
+        if not p.is_file():
+            return None
+
+        suffix = p.suffix.lower()
+
+        if suffix == ".png":
+            return "atlas"
+
+        if suffix == ".json":
+            key = classify_json_file(p)
+            if key is not None:
+                return key
+            if not self.spritemap_entry.get().strip():
+                return "spritemap"
+            if not self.animation_entry.get().strip():
+                return "animation"
+            return "animation"
+
+        return None
+
+    def _on_files_drop(self, event):
+        try:
+            paths = self.tk.splitlist(event.data)
+        except Exception:
+            return getattr(event, "action", None)
+
+        entries = {
+            "animation": self.animation_entry,
+            "spritemap": self.spritemap_entry,
+            "atlas": self.atlas_entry,
+        }
+
+        leftovers = []
+        for path in paths:
+            key = self._classify_dropped_file(path)
+            if key is None:
+                continue
+            entry = entries[key]
+            existing = entry.get().strip()
+            if existing and Path(existing) != Path(path):
+                leftovers.append(path)
+                continue
+            entry.delete(0, "end")
+            entry.insert(0, path)
+
+        for path in leftovers:
+            suffix = Path(path).suffix.lower()
+            for key in ("animation", "spritemap", "atlas"):
+                entry = entries[key]
+                if entry.get().strip():
+                    continue
+                if key == "atlas" and suffix != ".png":
+                    continue
+                if key != "atlas" and suffix != ".json":
+                    continue
+                entry.delete(0, "end")
+                entry.insert(0, path)
+                break
+
+        return getattr(event, "action", None)
+
     def _toggle_duration(self):
         if self.use_source_fps_var.get():
             self.duration_entry.configure(state="disabled")
@@ -624,13 +739,13 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
         else:
             filetypes = [("PNG Images", "*.png"), ("All Files", "*.*")]
             title = "Select Spritemap Image"
-        path = filedialog.askopenfilename(title=title, filetypes=filetypes)
+        path = filedialog.askopenfilename(parent=self, title=title, filetypes=filetypes)
         if path:
             entry.delete(0, "end")
             entry.insert(0, path)
 
     def _pick_output(self):
-        path = filedialog.askdirectory(title="Select Output Folder")
+        path = filedialog.askdirectory(parent=self, title="Select Output Folder")
         if path:
             self.output_entry.delete(0, "end")
             self.output_entry.insert(0, path)
@@ -667,9 +782,17 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
                     self._last_output_dir = p
                     self.open_folder_button.configure(state="normal")
             title = "Export Complete"
+            icon = "check"
             if "cancelled" in message.lower():
                 title = "Export Cancelled"
-            messagebox.showinfo(title, message)
+                icon = "warning"
+            CTkMessagebox(
+                master=self,
+                title=title,
+                message=message,
+                icon=icon,
+                option_1="OK",
+            )
 
         self._ui(update)
 
@@ -683,17 +806,26 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
                 if p.is_dir():
                     self._last_output_dir = p
                     self.open_folder_button.configure(state="normal")
-            messagebox.showerror("Export Failed", message)
+            CTkMessagebox(
+                master=self,
+                title="Export Failed",
+                message=message,
+                icon="cancel",
+                option_1="OK",
+            )
 
         self._ui(update)
 
     def _start_export(self):
         if self.worker is not None:
             if not self.worker.wait(timeout=2.0):
-                messagebox.showwarning(
-                    "Export In Progress",
-                    "The previous export is still running. Please wait for it "
+                CTkMessagebox(
+                    master=self,
+                    title="Export In Progress",
+                    message="The previous export is still running. Please wait for it "
                     "to finish or cancel it before starting a new one.",
+                    icon="warning",
+                    option_1="OK",
                 )
                 return
             self.worker = None
@@ -710,8 +842,12 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
                 self.output_entry.get().strip(),
             )
         ):
-            messagebox.showwarning(
-                "Missing Input", "Please fill in all file and folder paths."
+            CTkMessagebox(
+                master=self,
+                title="Missing Input",
+                message="Please fill in all file and folder paths.",
+                icon="warning",
+                option_1="OK",
             )
             return
 
@@ -721,12 +857,22 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
             ("Spritemap PNG", atlas_path),
         ):
             if not path.is_file():
-                messagebox.showwarning("File Not Found", f"{label} not found:\n{path}")
+                CTkMessagebox(
+                    master=self,
+                    title="File Not Found",
+                    message=f"{label} not found:\n{path}",
+                    icon="warning",
+                    option_1="OK",
+                )
                 return
 
         if not output_dir.is_dir():
-            messagebox.showwarning(
-                "Folder Not Found", f"Output folder not found:\n{output_dir}"
+            CTkMessagebox(
+                master=self,
+                title="Folder Not Found",
+                message=f"Output folder not found:\n{output_dir}",
+                icon="warning",
+                option_1="OK",
             )
             return
 
@@ -734,23 +880,43 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
             validate_animation_json(animation_path)
             validate_animation_json(spritemap_path)
         except ValueError as exc:
-            messagebox.showerror("Invalid Input", str(exc))
+            CTkMessagebox(
+                master=self,
+                title="Invalid Input",
+                message=str(exc),
+                icon="cancel",
+                option_1="OK",
+            )
             return
 
         try:
             duration = int(self.duration_var.get())
             loop = int(self.loop_var.get())
         except ValueError:
-            messagebox.showerror("Invalid Input", "Duration and Loop must be numbers.")
+            CTkMessagebox(
+                master=self,
+                title="Invalid Input",
+                message="Duration and Loop must be numbers.",
+                icon="cancel",
+                option_1="OK",
+            )
             return
         if duration <= 0:
-            messagebox.showerror(
-                "Invalid Input", "Duration must be a positive integer."
+            CTkMessagebox(
+                master=self,
+                title="Invalid Input",
+                message="Duration must be a positive integer.",
+                icon="cancel",
+                option_1="OK",
             )
             return
         if loop < 0:
-            messagebox.showerror(
-                "Invalid Input", "Loop must be 0 (infinite) or a positive integer."
+            CTkMessagebox(
+                master=self,
+                title="Invalid Input",
+                message="Loop must be 0 (infinite) or a positive integer.",
+                icon="cancel",
+                option_1="OK",
             )
             return
 
@@ -799,7 +965,13 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
             try:
                 os.startfile(path)
             except Exception as exc:
-                messagebox.showerror("Open Folder", f"Could not open folder:\n{exc}")
+                CTkMessagebox(
+                    master=self,
+                    title="Open Folder",
+                    message=f"Could not open folder:\n{exc}",
+                    icon="cancel",
+                    option_1="OK",
+                )
 
     def _set_exporting(self, exporting: bool):
         state = "disabled" if exporting else "normal"
