@@ -1,7 +1,7 @@
 # Spritemap to GIF
 A tool that allows you to extract Adobe Animate spritemap into individual GIFs in a single folder it also features configuration options and is built with CustomTkinter (formerly PySide6)
 
-Perfect for those of you who want to create GIFs from spritemap but don't have Adobe Animate.
+Perfect for those of you who want to create GIFs from spritemap but don't have Adobe Animate due not having money.
 
 ## Getting started
 1. Download this tool in GameBanana or GitHub and open the app
