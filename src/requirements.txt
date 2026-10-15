@@ -1,5 +1,6 @@
 customtkinter
-CTkMessagebox 
+CTkMessagebox
+CTkFileDialog@git+https://github.com/sirthegamercoder/CTkFileDialog 
 tkinterdnd2
 tkinter-icons[fluent-regular] 
 pillow

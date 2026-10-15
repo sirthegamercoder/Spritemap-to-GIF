@@ -12,13 +12,13 @@ try:
 except Exception:
     wintypes = None
     _HAS_WINTYPES = False
-from tkinter import filedialog
 from typing import Callable, Optional
 
 import customtkinter as ctk
 from PIL import Image, ImageTk
 from tkinterdnd2 import DND_FILES, TkinterDnD
 from tkinter_icons import FluentRegularIcon
+from CTkFileDialog import askopenfilename, askdirectory
 
 from CTkMessagebox import CTkMessagebox
 
@@ -734,18 +734,28 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _pick_file(self, entry: DropEntry, ext: str):
         if ext == ".json":
-            filetypes = [("JSON Files", "*.json"), ("All Files", "*.*")]
+            filetypes = ["*.json", "*.*"]
             title = "Select JSON File"
         else:
-            filetypes = [("PNG Images", "*.png"), ("All Files", "*.*")]
+            filetypes = ["*.png", "*.*"]
             title = "Select Spritemap Image"
-        path = filedialog.askopenfilename(parent=self, title=title, filetypes=filetypes)
+        path = askopenfilename(
+            title=title,
+            filetypes=filetypes,
+            autocomplete=True,
+            preview_img=(ext == ".png"),
+            icon=resource_path("icon.ico"),
+        )
         if path:
             entry.delete(0, "end")
             entry.insert(0, path)
 
     def _pick_output(self):
-        path = filedialog.askdirectory(parent=self, title="Select Output Folder")
+        path = askdirectory(
+            title="Select Output Folder",
+            autocomplete=True,
+            icon=resource_path("icon.ico"),
+        )
         if path:
             self.output_entry.delete(0, "end")
             self.output_entry.insert(0, path)
