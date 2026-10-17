@@ -237,10 +237,14 @@ class ExportWorker(threading.Thread):
                         f"Source framerate not available; falling back to {duration} ms"
                     )
 
-            root_name = renderer.get_root_animation_name() or "spritemap"
-            output_path = Path(self.output_dir) / sanitize_filename(root_name)
-            output_path.mkdir(parents=True, exist_ok=True)
-            self.on_log(f"Created output folder: {output_path}")
+            if self.root_animation_only:
+                output_path = Path(self.output_dir)
+                self.on_log(f"Using output folder: {output_path}")
+            else:
+                root_name = renderer.get_root_animation_name() or "spritemap"
+                output_path = Path(self.output_dir) / sanitize_filename(root_name)
+                output_path.mkdir(parents=True, exist_ok=True)
+                self.on_log(f"Created output folder: {output_path}")
 
             animations = list(renderer.iter_animations())
             total = len(animations)
@@ -408,6 +412,33 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
         y = work_y + max(0, (work_h - height) // 2)
 
         self.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _enable_mousewheel_scrolling(self):
+        canvas = getattr(self.scroll_frame, "_parent_canvas", None)
+        if canvas is None:
+            return
+
+        canvas.configure(yscrollincrement=20)
+
+        def _on_mousewheel(event):
+            steps = -int(event.delta / 120)
+            if event.state & 0x0004:
+                steps *= 3
+            canvas.yview_scroll(steps, "units")
+            return "break"
+
+        def _bind(widget):
+            try:
+                widget.bind("<MouseWheel>", _on_mousewheel, add="+")
+            except Exception:
+                pass
+            try:
+                for child in widget.winfo_children():
+                    _bind(child)
+            except Exception:
+                pass
+
+        _bind(self.scroll_frame)
 
     def _build_ui(self):
         self.grid_rowconfigure(0, weight=1)
@@ -605,6 +636,8 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
         self.progress_label = ctk.CTkLabel(self.scroll_frame, text="Ready", anchor="w")
         self.progress_label.grid(row=6, column=0, padx=16, pady=(0, 16), sticky="ew")
 
+        self.after(100, self._enable_mousewheel_scrolling)
+
     def _register_drop_recursive(self, widget, handler):
         if not isinstance(widget, DropEntry):
             try:
@@ -734,10 +767,10 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _pick_file(self, entry: DropEntry, ext: str):
         if ext == ".json":
-            filetypes = ["*.json", "*.*"]
+            filetypes = [("JSON Files", "*.json"), ("All Files", "*.*")]
             title = "Select JSON File"
         else:
-            filetypes = ["*.png", "*.*"]
+            filetypes = [("PNG Images", "*.png"), ("All Files", "*.*")]
             title = "Select Spritemap Image"
         path = askopenfilename(
             title=title,
