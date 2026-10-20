@@ -1,8 +1,8 @@
 customtkinter
-CTkMessagebox
+CTkMessagebox@git+https://github.com/sirthegamercoder/CTkMessagebox
 CTkFileDialog@git+https://github.com/sirthegamercoder/CTkFileDialog 
 tkinterdnd2
 tkinter-icons[fluent-regular] 
-pillow
+Pillow
 numpy
 auto-py-to-exe # Used to packaging app
