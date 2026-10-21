@@ -114,6 +114,7 @@ class SettingsStore:
         self.path = path or (_appdata_dir() / "config.json")
         self._data: dict = {}
         self.remember_paths: bool = False
+        self.remember_settings: bool = False
         self._load()
 
     def _load(self):
@@ -126,6 +127,7 @@ class SettingsStore:
         except Exception:
             self._data = {}
         self.remember_paths = bool(self._data.get("remember_paths", False))
+        self.remember_settings = bool(self._data.get("remember_settings", False))
 
     def get(self, key: str, default=None):
         return self._data.get(key, default)
@@ -136,18 +138,26 @@ class SettingsStore:
     def save(self):
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            payload = {"version": CONFIG_VERSION, "remember_paths": self.remember_paths}
-            for k in self.UI_KEYS:
-                if k in self._data:
-                    payload[k] = self._data[k]
+            payload = {
+                "version": CONFIG_VERSION,
+                "remember_paths": self.remember_paths,
+                "remember_settings": self.remember_settings,
+            }
+            if self.remember_settings:
+                for k in self.UI_KEYS:
+                    if k in self._data:
+                        payload[k] = self._data[k]
+
             if self.remember_paths:
                 for k in self.PATH_KEYS:
                     if k in self._data:
                         payload[k] = self._data[k]
+
             tmp = self.path.with_suffix(".json.tmp")
             with tmp.open("w", encoding="utf-8") as fh:
                 json.dump(payload, fh, indent=2)
             os.replace(tmp, self.path)
+
         except Exception as exc:
             print(f"[settings] WARNING: could not save config: {exc}", file=sys.stderr)
 
@@ -725,44 +735,66 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
             row=0, column=0, padx=10, pady=(10, 6), sticky="w"
         )
 
+        render_opts = ctk.CTkFrame(options_frame, fg_color="transparent")
+        render_opts.grid(row=1, column=0, padx=10, pady=(0, 6), sticky="ew")
+        render_opts.grid_columnconfigure(0, weight=1)
+
         self.filter_single_var = ctk.BooleanVar(value=True)
         self.filter_single_check = ctk.CTkCheckBox(
-            options_frame,
+            render_opts,
             text="Filter single-frame animations",
             variable=self.filter_single_var,
         )
-        self.filter_single_check.grid(row=1, column=0, padx=10, pady=4, sticky="w")
+        self.filter_single_check.grid(row=0, column=0, pady=4, sticky="w")
 
         self.filter_unused_var = ctk.BooleanVar(value=False)
         self.filter_unused_check = ctk.CTkCheckBox(
-            options_frame, text="Filter unused symbols", variable=self.filter_unused_var
+            render_opts, text="Filter unused symbols", variable=self.filter_unused_var
         )
-        self.filter_unused_check.grid(row=2, column=0, padx=10, pady=4, sticky="w")
+        self.filter_unused_check.grid(row=1, column=0, pady=4, sticky="w")
 
         self.root_only_var = ctk.BooleanVar(value=False)
         self.root_only_check = ctk.CTkCheckBox(
-            options_frame, text="Root animation only", variable=self.root_only_var
+            render_opts, text="Root animation only", variable=self.root_only_var
         )
-        self.root_only_check.grid(row=3, column=0, padx=10, pady=4, sticky="w")
+        self.root_only_check.grid(row=2, column=0, pady=4, sticky="w")
 
         self.animate_mc_var = ctk.BooleanVar(value=True)
         self.animate_mc_check = ctk.CTkCheckBox(
-            options_frame,
+            render_opts,
             text="Animate movie clips",
             variable=self.animate_mc_var,
         )
-        self.animate_mc_check.grid(row=4, column=0, padx=10, pady=(4, 10), sticky="w")
+        self.animate_mc_check.grid(row=3, column=0, pady=4, sticky="w")
+
+        separator = ctk.CTkFrame(
+            options_frame, height=1, fg_color=("#3a3a3a", "#3a3a3a")
+        )
+        separator.grid(row=2, column=0, padx=10, pady=(4, 8), sticky="ew")
+
+        persist_opts = ctk.CTkFrame(options_frame, fg_color="transparent")
+        persist_opts.grid(row=3, column=0, padx=10, pady=(0, 10), sticky="ew")
+        persist_opts.grid_columnconfigure(0, weight=1)
 
         self.remember_paths_var = ctk.BooleanVar(value=self.settings.remember_paths)
         self.remember_paths_check = ctk.CTkCheckBox(
-            options_frame,
+            persist_opts,
             text="Remember last used file/folder paths",
             variable=self.remember_paths_var,
             command=self._on_remember_paths_toggled,
         )
-        self.remember_paths_check.grid(
-            row=5, column=0, padx=10, pady=(0, 10), sticky="w"
+        self.remember_paths_check.grid(row=0, column=0, pady=4, sticky="w")
+
+        self.remember_settings_var = ctk.BooleanVar(
+            value=self.settings.remember_settings
         )
+        self.remember_settings_check = ctk.CTkCheckBox(
+            persist_opts,
+            text="Remember settings",
+            variable=self.remember_settings_var,
+            command=self._on_remember_settings_toggled,
+        )
+        self.remember_settings_check.grid(row=1, column=0, pady=4, sticky="w")
 
         button_frame = ctk.CTkFrame(self.scroll_frame, fg_color="transparent")
         button_frame.grid(row=4, column=0, padx=16, pady=8, sticky="ew")
@@ -981,6 +1013,17 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
             for key in SettingsStore.PATH_KEYS:
                 self.settings._data.pop(key, None)
             self.settings.save()
+
+    def _on_remember_settings_toggled(self):
+        enabled = self.remember_settings_var.get()
+        self.settings.remember_settings = enabled
+
+        if enabled:
+            self._collect_settings_into_store()
+        else:
+            for key in SettingsStore.UI_KEYS:
+                self.settings._data.pop(key, None)
+        self.settings.save()
 
     def _toggle_log_panel(self):
         if self.log_panel.winfo_ismapped():
@@ -1322,6 +1365,7 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
             self.root_only_check,
             self.animate_mc_check,
             self.remember_paths_check,
+            self.remember_settings_check,
         ):
             try:
                 widget.configure(state=state)
@@ -1338,14 +1382,17 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
     def _apply_settings(self):
         s = self.settings
         self.remember_paths_var.set(bool(s.remember_paths))
-        self.duration_var.set(str(s.get("duration", self.duration_var.get())))
-        self.loop_var.set(str(s.get("loop", self.loop_var.get())))
-        self.disposal_var.set(str(s.get("disposal", self.disposal_var.get())))
-        self.use_source_fps_var.set(bool(s.get("use_source_fps", False)))
-        self.filter_single_var.set(bool(s.get("filter_single_frame", True)))
-        self.filter_unused_var.set(bool(s.get("filter_unused_symbols", False)))
-        self.root_only_var.set(bool(s.get("root_animation_only", False)))
-        self.animate_mc_var.set(bool(s.get("animate_movie_clips", True)))
+        self.remember_settings_var.set(bool(s.remember_settings))
+
+        if s.remember_settings:
+            self.duration_var.set(str(s.get("duration", self.duration_var.get())))
+            self.loop_var.set(str(s.get("loop", self.loop_var.get())))
+            self.disposal_var.set(str(s.get("disposal", self.disposal_var.get())))
+            self.use_source_fps_var.set(bool(s.get("use_source_fps", False)))
+            self.filter_single_var.set(bool(s.get("filter_single_frame", True)))
+            self.filter_unused_var.set(bool(s.get("filter_unused_symbols", False)))
+            self.root_only_var.set(bool(s.get("root_animation_only", False)))
+            self.animate_mc_var.set(bool(s.get("animate_movie_clips", True)))
         self._toggle_duration()
 
         if s.remember_paths:
@@ -1359,18 +1406,22 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
     def _collect_settings_into_store(self):
         s = self.settings
         s.remember_paths = self.remember_paths_var.get()
-        s.set("duration", self.duration_var.get())
-        s.set("loop", self.loop_var.get())
-        s.set("disposal", self.disposal_var.get())
-        s.set("use_source_fps", self.use_source_fps_var.get())
-        s.set("filter_single_frame", self.filter_single_var.get())
-        s.set("filter_unused_symbols", self.filter_unused_var.get())
-        s.set("root_animation_only", self.root_only_var.get())
-        s.set("animate_movie_clips", self.animate_mc_var.get())
-        try:
-            s.set("window_geometry", self.geometry())
-        except Exception:
-            pass
+        s.remember_settings = self.remember_settings_var.get()
+
+        if s.remember_settings:
+            s.set("duration", self.duration_var.get())
+            s.set("loop", self.loop_var.get())
+            s.set("disposal", self.disposal_var.get())
+            s.set("use_source_fps", self.use_source_fps_var.get())
+            s.set("filter_single_frame", self.filter_single_var.get())
+            s.set("filter_unused_symbols", self.filter_unused_var.get())
+            s.set("root_animation_only", self.root_only_var.get())
+            s.set("animate_movie_clips", self.animate_mc_var.get())
+            try:
+                s.set("window_geometry", self.geometry())
+            except Exception:
+                pass
+
         if s.remember_paths:
             s.set("animation_path", self.animation_entry.get().strip())
             s.set("spritemap_path", self.spritemap_entry.get().strip())
