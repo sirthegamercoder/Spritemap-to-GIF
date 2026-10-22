@@ -3,6 +3,6 @@ CTkMessagebox@git+https://github.com/sirthegamercoder/CTkMessagebox
 CTkFileDialog@git+https://github.com/sirthegamercoder/CTkFileDialog 
 tkinterdnd2
 tkinter-icons[fluent-regular] 
-Pillow
+Pillow>=9.0
 numpy
 auto-py-to-exe # Used to packaging app

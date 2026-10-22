@@ -1054,24 +1054,21 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
             entry = entries[key]
             existing = entry.get().strip()
             if existing and Path(existing) != Path(path):
-                leftovers.append(path)
+                leftovers.append((key, path))
                 continue
             entry.delete(0, "end")
             entry.insert(0, path)
 
-        for path in leftovers:
-            suffix = Path(path).suffix.lower()
-            for key in ("animation", "spritemap", "atlas"):
-                entry = entries[key]
-                if entry.get().strip():
-                    continue
-                if key == "atlas" and suffix != ".png":
-                    continue
-                if key != "atlas" and suffix != ".json":
-                    continue
-                entry.delete(0, "end")
-                entry.insert(0, path)
-                break
+        for key, path in leftovers:
+            entry = entries[key]
+            if entry.get().strip():
+                self._append_log_panel(
+                    f"Ignored dropped file (a different {key} is already "
+                    f"selected): {path}"
+                )
+                continue
+            entry.delete(0, "end")
+            entry.insert(0, path)
 
         self._update_export_button_state()
         return getattr(event, "action", None)

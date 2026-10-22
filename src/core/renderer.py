@@ -1030,12 +1030,27 @@ class Symbols:
         if union is None:
             return None
 
-        return (
+        canvas_w, canvas_h = self.canvas_size
+        clamped = (
+            max(0, union[0] - padding),
+            max(0, union[1] - padding),
+            min(canvas_w, union[2] + padding),
+            min(canvas_h, union[3] + padding),
+        )
+        if clamped[0] >= clamped[2] or clamped[1] >= clamped[3]:
+            return None
+        if clamped != (
             max(0, union[0] - padding),
             max(0, union[1] - padding),
             union[2] + padding,
             union[3] + padding,
-        )
+        ):
+            warnings.warn(
+                f"Animation `{name or '<root>'}` extends beyond the "
+                f"{canvas_w}x{canvas_h} canvas; content outside the canvas is "
+                f"clipped. Increase canvas_size if this is unintended."
+            )
+        return clamped
 
     def render_symbol_compact(
         self,
@@ -1046,6 +1061,17 @@ class Symbols:
         vp_x, vp_y, vp_x2, vp_y2 = viewport
         compact_w = max(1, vp_x2 - vp_x)
         compact_h = max(1, vp_y2 - vp_y)
+
+        canvas_w, canvas_h = self.canvas_size
+        if vp_x2 > canvas_w or vp_y2 > canvas_h:
+            warnings.warn(
+                f"Viewport {viewport} exceeds canvas {self.canvas_size}; "
+                f"clamping compact viewport."
+            )
+            vp_x2 = min(vp_x2, canvas_w)
+            vp_y2 = min(vp_y2, canvas_h)
+            compact_w = max(1, vp_x2 - vp_x)
+            compact_h = max(1, vp_y2 - vp_y)
 
         canvas = Image.new("RGBA", (compact_w, compact_h), color=self.background_color)
 
@@ -1288,43 +1314,59 @@ class Symbols:
                 )
                 continue
 
-            nested_base = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
-            self._render_layer_group(
-                nested_base,
-                base_layers,
-                frame_index,
-                matrix,
-                color,
-                canvas_size,
-                context=context,
-                _depth=_depth + 1,
-            )
-
-            nested_mask = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
+            nested_mask_full = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
             self._render_single_layer(
-                nested_mask, clip_layer, frame_index, matrix, color, canvas_size
+                nested_mask_full, clip_layer, frame_index, matrix, color, canvas_size
             )
-
-            mask_bbox = nested_mask.getbbox()
+            mask_bbox = nested_mask_full.getbbox()
             if mask_bbox is None:
+                nested_mask_full.close()
                 warnings.warn(
                     f"Mask `{clip_layer.get('LN')}`{context} is fully "
                     f"transparent; dropping group."
                 )
                 continue
 
-            nested_base = nested_base.crop(mask_bbox)
-            nested_mask = nested_mask.crop(mask_bbox)
-            masked_alpha = nested_base.getchannel("A")
-            mask_alpha = nested_mask.getchannel("A")
+            region = (mask_bbox[0], mask_bbox[1], mask_bbox[2], mask_bbox[3])
+            region_w = region[2] - region[0]
+            region_h = region[3] - region[1]
 
-            mask_arr = np.array(mask_alpha)
-            max_mask = int(mask_arr.max())
-            if max_mask > 0:
-                mask_arr = mask_arr / max_mask * 255
-            mask_alpha = Image.fromarray(mask_arr.clip(0, 255).astype("uint8"), "L")
-            nested_base.putalpha(ImageChops.multiply(masked_alpha, mask_alpha))
-            canvas.alpha_composite(nested_base, dest=mask_bbox[:2])
+            nested_base = Image.new("RGBA", (region_w, region_h), (0, 0, 0, 0))
+            nested_mask = Image.new("RGBA", (region_w, region_h), (0, 0, 0, 0))
+            try:
+                region_matrix = TransformMatrix(c=-region[0], f=-region[1]) @ matrix
+                self._render_layer_group(
+                    nested_base,
+                    base_layers,
+                    frame_index,
+                    region_matrix,
+                    color,
+                    (region_w, region_h),
+                    context=context,
+                    _depth=_depth + 1,
+                )
+                self._render_single_layer(
+                    nested_mask,
+                    clip_layer,
+                    frame_index,
+                    region_matrix,
+                    color,
+                    (region_w, region_h),
+                )
+
+                masked_alpha = nested_base.getchannel("A")
+                mask_alpha = nested_mask.getchannel("A")
+                mask_arr = np.array(mask_alpha)
+                max_mask = int(mask_arr.max())
+                if max_mask > 0:
+                    mask_arr = mask_arr / max_mask * 255
+                mask_alpha = Image.fromarray(mask_arr.clip(0, 255).astype("uint8"), "L")
+                nested_base.putalpha(ImageChops.multiply(masked_alpha, mask_alpha))
+                canvas.alpha_composite(nested_base, dest=region[:2])
+            finally:
+                nested_mask_full.close()
+                nested_base.close()
+                nested_mask.close()
 
     def _render_symbol(self, canvas, name, frame_index, matrix, color, canvas_size):
         layers = list(reversed(self.timelines.get(name, [])))
@@ -1613,13 +1655,13 @@ class AdobeSpritemapRenderer:
             self.root_animation_only = root_animation_only
             self.animate_movie_clips = animate_movie_clips
 
-            direct_children = collect_direct_child_symbols(self.animation_json)
-            if direct_children:
-                self._referenced_symbols = direct_children
-            elif filter_unused_symbols:
+            if filter_unused_symbols:
                 self._referenced_symbols = collect_referenced_symbols(
                     self.animation_json
                 )
+            elif root_animation_only:
+                direct_children = collect_direct_child_symbols(self.animation_json)
+                self._referenced_symbols = direct_children or None
             else:
                 self._referenced_symbols = None
 
