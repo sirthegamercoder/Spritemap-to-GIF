@@ -539,6 +539,11 @@ def collect_referenced_symbols(animation_json: dict) -> Set[str]:
     return referenced
 
 
+def collect_direct_child_symbols(animation_json: dict) -> Set[str]:
+    root_layers = animation_json.get("AN", {}).get("TL", {}).get("L", [])
+    return _collect_symbol_refs_from_layers(root_layers)
+
+
 def _frame_duration(frame: dict) -> int:
     duration = frame.get("DU", 1)
     try:
@@ -1608,7 +1613,10 @@ class AdobeSpritemapRenderer:
             self.root_animation_only = root_animation_only
             self.animate_movie_clips = animate_movie_clips
 
-            if filter_unused_symbols:
+            direct_children = collect_direct_child_symbols(self.animation_json)
+            if direct_children:
+                self._referenced_symbols = direct_children
+            elif filter_unused_symbols:
                 self._referenced_symbols = collect_referenced_symbols(
                     self.animation_json
                 )
