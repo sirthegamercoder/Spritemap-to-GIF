@@ -41,6 +41,11 @@ SYMBOL_TYPE_MAP = {
     "button": "BTN",
 }
 
+_MAX_CLIP_DEPTH = 32
+_MAX_CANVAS_DIM = 16384
+_CANVAS_PADDING = 32.0
+_COMPOSED_CACHE_LIMIT = 512
+
 FrameTuple = Tuple[str, Image.Image, Tuple[int, int, int, int, int, int]]
 
 
@@ -781,7 +786,7 @@ class SpriteAtlas:
         self.sprite_info = {}
         self.sprites = {}
         self._composed_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
-        self._composed_cache_limit = 512
+        self._composed_cache_limit = _COMPOSED_CACHE_LIMIT
         self._warned_oob: set = set()
 
         actual_w, actual_h = atlas_image.size
@@ -1061,7 +1066,7 @@ class Symbols:
         matrix: TransformMatrix,
         _depth: int = 0,
     ) -> Optional[Tuple[int, int, int, int]]:
-        if _depth > 32:
+        if _depth > _MAX_CLIP_DEPTH:
             return None
 
         layers = list(reversed(self.timelines.get(name, [])))
@@ -1076,7 +1081,7 @@ class Symbols:
         matrix: TransformMatrix,
         _depth: int = 0,
     ) -> Optional[Tuple[int, int, int, int]]:
-        if _depth > 32:
+        if _depth > _MAX_CLIP_DEPTH:
             return None
 
         combined: Optional[Tuple[int, int, int, int]] = None
@@ -1254,8 +1259,10 @@ class Symbols:
         context: str = "",
         _depth: int = 0,
     ):
-        if _depth > 32:
-            warnings.warn("Clip nesting exceeded 32 levels; aborting recursion.")
+        if _depth > _MAX_CLIP_DEPTH:
+            warnings.warn(
+                f"Clip nesting exceeded {_MAX_CLIP_DEPTH} levels; aborting recursion."
+            )
             return
 
         for group in self._group_clip_layers(layers):
@@ -1344,8 +1351,17 @@ class Symbols:
         first_frame = max(0, min(first_frame, symbol_length - 1))
 
         symbol_type = (instance.get("ST") or "G").upper()
-        loop_mode = instance.get("LP") or "LP"
-        loop_mode = loop_mode.upper() if isinstance(loop_mode, str) else "LP"
+        raw_loop = instance.get("LP")
+        if raw_loop is None:
+            loop_mode = "LP"
+        else:
+            loop_mode = str(raw_loop).upper()
+        if loop_mode not in {"LP", "PO", "SF"}:
+            warnings.warn(
+                f"Unrecognized loop mode {raw_loop!r} on instance of "
+                f"`{symbol_name}`; defaulting to 'LP'."
+            )
+            loop_mode = "LP"
 
         if loop_mode == "SF":
             return first_frame
@@ -1534,11 +1550,11 @@ def _infer_canvas_size(animation_json, spritemap_json, atlas_size):
     span_x = max(abs(min_x), abs(max_x)) * 2.0
     span_y = max(abs(min_y), abs(max_y)) * 2.0
 
-    padding = 32.0
+    padding = _CANVAS_PADDING
     inferred_width = int(math.ceil(span_x + padding))
     inferred_height = int(math.ceil(span_y + padding))
 
-    MAX_CANVAS_DIM = 16384
+    MAX_CANVAS_DIM = _MAX_CANVAS_DIM
     if inferred_width > MAX_CANVAS_DIM or inferred_height > MAX_CANVAS_DIM:
         warnings.warn(
             f"Inferred canvas size ({inferred_width}x{inferred_height}) exceeds "
