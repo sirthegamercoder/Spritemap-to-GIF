@@ -4,6 +4,7 @@ import subprocess
 import sys
 import threading
 import ctypes
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -477,7 +478,13 @@ class ExportWorker(threading.Thread):
 
                 try:
 
+                    frame_counter = 0
+
                     def _on_frame(idx: int) -> bool:
+                        nonlocal frame_counter
+                        frame_counter += 1
+                        if frame_counter % 5 == 0:
+                            time.sleep(0.001)
                         if self._cancel:
                             return False
                         self.on_progress(index, total, safe_name, idx + 1, 0)

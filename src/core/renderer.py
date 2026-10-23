@@ -44,7 +44,7 @@ SYMBOL_TYPE_MAP = {
 _MAX_CLIP_DEPTH = 32
 _MAX_CANVAS_DIM = 16384
 _CANVAS_PADDING = 32.0
-_COMPOSED_CACHE_LIMIT = 512
+_COMPOSED_CACHE_LIMIT = 48
 
 FrameTuple = Tuple[str, Image.Image, Tuple[int, int, int, int, int, int]]
 
@@ -1013,22 +1013,14 @@ class Symbols:
     ) -> Optional[Tuple[int, int, int, int]]:
         return self._compute_bounds(name, frame_index, self.center_in_canvas)
 
-    def compute_union_bounds(
-        self,
-        name: Optional[str],
-        start_frame: int,
-        end_frame: int,
-        padding: int = 2,
-    ) -> Optional[Tuple[int, int, int, int]]:
-        union: Optional[Tuple[int, int, int, int]] = None
-        for frame_index in range(start_frame, end_frame):
-            frame_bounds = self._compute_bounds(
-                name, frame_index, self.center_in_canvas
-            )
-            union = _union_bounds(union, frame_bounds)
-
-        if union is None:
-            return None
+    def compute_union_bounds(self, name, start_frame, end_frame, padding=2, stride=1):
+        union = None
+        frame_indices = list(range(start_frame, end_frame, stride))
+        if frame_indices and frame_indices[-1] != end_frame - 1:
+            frame_indices.append(end_frame - 1)
+        for frame_index in frame_indices:
+            b = self._compute_bounds(name, frame_index, self.center_in_canvas)
+            union = _union_bounds(union, b)
 
         canvas_w, canvas_h = self.canvas_size
         clamped = (
@@ -1783,62 +1775,49 @@ class AdobeSpritemapRenderer:
         total_frames = self.symbols.length(symbol_name)
         if total_frames == 0:
             return []
-
         if end_frame is None or end_frame > total_frames:
             end_frame = total_frames
-
         if start_frame >= end_frame:
             return []
 
-        union_bounds = self.symbols.compute_union_bounds(
-            symbol_name, start_frame, end_frame
+        span = end_frame - start_frame
+        stride = max(1, span // 40)
+        viewport = self.symbols.compute_union_bounds(
+            symbol_name, start_frame, end_frame, stride=stride
         )
-        if union_bounds is None:
+        if viewport is None:
             return []
 
-        frames_with_index: List[Tuple[int, Image.Image]] = []
+        prefix = frame_name_prefix or (symbol_name if symbol_name else "timeline")
+        rendered_frames = []
+        min_x, min_y = float("inf"), float("inf")
+        max_x, max_y = 0, 0
+
         for frame_index in range(start_frame, end_frame):
-            frame_image = self.symbols.render_symbol_compact(
-                symbol_name, frame_index, union_bounds
+            frame = self.symbols.render_symbol_compact(
+                symbol_name, frame_index, viewport
             )
-            if frame_image is not None:
-                frames_with_index.append((frame_index - start_frame, frame_image))
-
-        if not frames_with_index:
-            return []
-
-        min_x, min_y, max_x, max_y = float("inf"), float("inf"), 0, 0
-        for _, frame in frames_with_index:
+            if frame is None:
+                continue
             bbox = frame.getbbox()
             if bbox:
                 min_x = min(min_x, bbox[0])
                 min_y = min(min_y, bbox[1])
                 max_x = max(max_x, bbox[2])
                 max_y = max(max_y, bbox[3])
+            rendered_frames.append((frame_index - start_frame, frame))
 
         if min_x > max_x:
-            for _, frame in frames_with_index:
+            for _, frame in rendered_frames:
                 frame.close()
             return []
 
-        prefix = frame_name_prefix or (symbol_name if symbol_name else "timeline")
-
-        rendered_frames: List[
-            Tuple[str, Image.Image, Tuple[int, int, int, int, int, int]]
-        ] = []
-        for frame_index, frame in frames_with_index:
-            cropped_frame = frame.crop((min_x, min_y, max_x, max_y))
+        cropped = []
+        for idx, frame in rendered_frames:
+            c = frame.crop((min_x, min_y, max_x, max_y))
             frame.close()
-            frame_name = f"{prefix}_{frame_index:04d}"
-            rendered_frames.append(
-                (
-                    frame_name,
-                    cropped_frame,
-                    (0, 0, cropped_frame.width, cropped_frame.height, 0, 0),
-                )
-            )
-
-        return rendered_frames
+            cropped.append((f"{prefix}_{idx:04d}", c, (0, 0, c.width, c.height, 0, 0)))
+        return cropped
 
     def _iter_symbol_frames(
         self,
@@ -1861,8 +1840,10 @@ class AdobeSpritemapRenderer:
         if start_frame >= end_frame:
             return
 
+        span = end_frame - start_frame
+        stride = max(1, span // 40)
         viewport = self.symbols.compute_union_bounds(
-            symbol_name, start_frame, end_frame
+            symbol_name, start_frame, end_frame, stride=stride
         )
         if viewport is None:
             return
