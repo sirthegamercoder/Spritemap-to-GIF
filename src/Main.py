@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -47,6 +48,8 @@ APP_NAME = "SpritemapToGIF"
 CONFIG_VERSION = 1
 
 _LOG_MAX_BYTES = 2 * 1024 * 1024
+
+_ANIMATION_FILENAME = "Animation.json"
 
 
 def _icon(name: str, size: int = ICON_SIZE, color: str = ICON_COLOR):
@@ -107,6 +110,7 @@ class SettingsStore:
         "window_geometry",
     )
     PATH_KEYS = (
+        "export_dir",
         "animation_path",
         "spritemap_path",
         "atlas_path",
@@ -303,11 +307,46 @@ def classify_json_file(path: Path) -> Optional[str]:
     return None
 
 
+def _find_animation_json(folder: Path) -> Optional[Path]:
+    direct = folder / _ANIMATION_FILENAME
+    if direct.is_file():
+        return direct
+    try:
+        for candidate in folder.iterdir():
+            if not candidate.is_file() or candidate.suffix.lower() != ".json":
+                continue
+            if classify_json_file(candidate) == "animation":
+                return candidate
+    except OSError:
+        pass
+    return None
+
+
+def _folder_has_spritemap_pages(folder: Path) -> bool:
+    def _check(dir_path: Path, depth: int) -> bool:
+        try:
+            for candidate in dir_path.iterdir():
+                if candidate.is_file() and candidate.name.lower().startswith(
+                    "spritemap"
+                ):
+                    if candidate.suffix.lower() == ".json":
+                        return True
+                elif candidate.is_dir() and depth < 1:
+                    if _check(candidate, depth + 1):
+                        return True
+        except OSError:
+            pass
+        return False
+
+    return _check(folder, 0)
+
+
 class DropEntry(ctk.CTkEntry):
     def __init__(self, master, file_mode="file", extensions=(), **kwargs):
         super().__init__(master, **kwargs)
         self.file_mode = file_mode
         self.extensions = tuple(e.lower() for e in extensions)
+        self._drops_enabled = True
         try:
             self.drop_target_register(DND_FILES)
             self.dnd_bind("<<Drop>>", self._on_drop)
@@ -330,6 +369,8 @@ class DropEntry(ctk.CTkEntry):
             return False
 
     def _on_drop(self, event):
+        if not self._drops_enabled:
+            return getattr(event, "action", None)
         try:
             paths = self.tk.splitlist(event.data)
         except Exception:
@@ -426,6 +467,10 @@ class ExportWorker(threading.Thread):
             except ValueError as exc:
                 self.on_error(f"Invalid spritemap/animation: {exc}")
                 self._write_log(f"ERROR: Invalid spritemap/animation: {exc}")
+                return
+            except FileNotFoundError as exc:
+                self.on_error(str(exc))
+                self._write_log(f"ERROR: {exc}")
                 return
 
             duration = self.duration
@@ -555,11 +600,12 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
             print(f"[icon] WARNING: could not set window icon: {exc}", file=sys.stderr)
 
         self._preferred_size = (750, 770)
-        self._min_size = (620, 480)
+        self._min_size = (620, 620)
 
         self.worker: Optional[ExportWorker] = None
         self._last_output_dir: Optional[Path] = None
         self._closing = False
+        self._log_visible = False
 
         self.settings = SettingsStore()
 
@@ -580,6 +626,9 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
             "cancel": _icon(
                 "ic-fluent-record-stop-24-regular", ICON_SIZE_LARGE, "#FFFFFF"
             ),
+            "remove": _icon(
+                "ic-fluent-share-screen-stop-24-regular", ICON_SIZE_LARGE, "#FFFFFF"
+            ),
             "open": _icon(
                 "ic-fluent-folder-open-24-regular", ICON_SIZE_LARGE, "#FFFFFF"
             ),
@@ -589,6 +638,9 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
         self._fit_to_screen()
         self._apply_settings()
         self._update_export_button_state()
+
+        self.bind("<Control-Return>", lambda _e: self._start_export())
+        self.bind("<Escape>", lambda _e: self._cancel_export())
 
     def _get_usable_screen_area(self):
         sw = self.winfo_screenwidth()
@@ -633,8 +685,16 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
         saved = self.settings.get("window_geometry")
         if isinstance(saved, str) and "x" in saved:
             try:
-                self.geometry(saved)
-                return
+                match = re.match(r"(\d+)x(\d+)([+-]\d+)([+-]\d+)", saved)
+                if match:
+                    w = min(int(match.group(1)), max_w)
+                    h = min(int(match.group(2)), max_h)
+                    x = int(match.group(3))
+                    y = int(match.group(4))
+                    x = max(work_x, min(x, work_x + work_w - w))
+                    y = max(work_y, min(y, work_y + work_h - h))
+                    self.geometry(f"{w}x{h}+{x}+{y}")
+                    return
             except Exception:
                 pass
 
@@ -704,6 +764,65 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
                 except Exception:
                     pass
 
+    def _in_folder_mode(self) -> bool:
+        return bool(self.export_dir_entry.get().strip())
+
+    def _sync_input_mode(self):
+        in_folder = self._in_folder_mode()
+        file_state = "disabled" if in_folder else "normal"
+
+        for widget in (self.spritemap_entry, self.atlas_entry):
+            try:
+                widget.configure(state=file_state)
+            except Exception:
+                pass
+            if hasattr(widget, "_drops_enabled"):
+                widget._drops_enabled = not in_folder
+
+        try:
+            if in_folder:
+                self.hint_label.configure(
+                    text="Folder mode: spritemap pages are auto-discovered."
+                )
+                self.hint_label.grid()
+            else:
+                self.hint_label.configure(text="")
+                self.hint_label.grid_remove()
+        except Exception:
+            pass
+
+        self._update_export_button_state()
+
+    def _on_export_dir_changed(self):
+        self._sync_input_mode()
+
+    def _on_export_dir_browse(self):
+        path = askdirectory(
+            title="Select Export Folder",
+            autocomplete=True,
+            icon=determine_icon(),
+        )
+        if path:
+            self.export_dir_entry.delete(0, "end")
+            self.export_dir_entry.insert(0, path)
+            self._autofill_animation_from_folder(path)
+
+    def _autofill_animation_from_folder(self, folder: str):
+        try:
+            folder_path = Path(folder)
+        except Exception:
+            return
+        if not folder_path.is_dir():
+            return
+        animation = _find_animation_json(folder_path)
+        if animation is not None:
+            self.animation_entry.delete(0, "end")
+            self.animation_entry.insert(0, str(animation))
+
+    def _clear_export_dir(self):
+        self.export_dir_entry.delete(0, "end")
+        self._sync_input_mode()
+
     def _build_ui(self):
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(0, weight=1)
@@ -720,14 +839,51 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
             row=0, column=0, columnspan=3, padx=10, pady=(10, 6), sticky="w"
         )
 
+        ctk.CTkLabel(files_frame, text="Export Folder:", anchor="e", width=120).grid(
+            row=1, column=0, padx=(10, 6), pady=6, sticky="e"
+        )
+        self.export_dir_entry = DropEntry(
+            files_frame,
+            file_mode="folder",
+            placeholder_text="Optional: pick the export folder to auto-discover pages",
+        )
+        self.export_dir_entry.grid(row=1, column=1, padx=6, pady=6, sticky="ew")
+
+        folder_buttons = ctk.CTkFrame(files_frame, fg_color="transparent")
+        folder_buttons.grid(row=1, column=2, padx=(6, 10), pady=6, sticky="w")
+        self._browse_button(folder_buttons, self._on_export_dir_browse).grid(
+            row=0, column=0
+        )
+        ctk.CTkButton(
+            folder_buttons,
+            text="",
+            image=self._icons.get("remove"),
+            width=40,
+            fg_color="#37474F",
+            hover_color="#455A64",
+            command=self._clear_export_dir,
+        ).grid(row=0, column=1, padx=(4, 0))
+
+        self.hint_label = ctk.CTkLabel(
+            files_frame,
+            text="",
+            anchor="w",
+            text_color=ICON_COLOR_MUTED,
+            font=ctk.CTkFont(size=11),
+        )
+        self.hint_label.grid(
+            row=2, column=0, columnspan=3, padx=10, pady=(0, 4), sticky="w"
+        )
+        self.hint_label.grid_remove()
+
         self.animation_entry = self._add_file_row(
-            files_frame, 2, "Animation JSON:", "animation.json (drag & drop)", ".json"
+            files_frame, 3, "Animation JSON:", "animation.json (drag & drop)", ".json"
         )
         self.spritemap_entry = self._add_file_row(
-            files_frame, 3, "Spritemap JSON:", "spritemap.json (drag & drop)", ".json"
+            files_frame, 4, "Spritemap JSON:", "spritemap.json (drag & drop)", ".json"
         )
         self.atlas_entry = self._add_file_row(
-            files_frame, 4, "Spritemap PNG:", "spritemap.png (drag & drop)", ".png"
+            files_frame, 5, "Spritemap PNG:", "spritemap.png (drag & drop)", ".png"
         )
 
         self._make_droppable(files_frame, self._on_files_drop)
@@ -849,7 +1005,7 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
         )
         self.root_only_check.grid(row=2, column=0, pady=4, sticky="w")
 
-        self.animate_mc_var = ctk.BooleanVar(value=True)
+        self.animate_mc_var = ctk.BooleanVar(value=False)
         self.animate_mc_check = ctk.CTkCheckBox(
             render_opts,
             text="Animate movie clips",
@@ -965,6 +1121,7 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
         ):
             var.trace_add("write", lambda *_: self._update_export_button_state())
         for entry in (
+            self.export_dir_entry,
             self.animation_entry,
             self.spritemap_entry,
             self.atlas_entry,
@@ -977,11 +1134,25 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
             )
             orig_insert = entry.insert
 
-            def _wrapped_insert(index, string, _orig=orig_insert):
-                _orig(index, string)
+            def _wrapped_insert(index, string, *a, _orig=orig_insert, **kw):
+                result = _orig(index, string, *a, **kw)
                 self._update_export_button_state()
+                return result
 
             entry.insert = _wrapped_insert
+
+        self.export_dir_entry.bind(
+            "<KeyRelease>", lambda *_: self._on_export_dir_changed(), add="+"
+        )
+        _orig_dir_insert = self.export_dir_entry.insert
+
+        def _wrapped_dir_insert(index, string, *a, _orig=_orig_dir_insert, **kw):
+            result = _orig(index, string, *a, **kw)
+            self._autofill_animation_from_folder(self.export_dir_entry.get().strip())
+            self._on_export_dir_changed()
+            return result
+
+        self.export_dir_entry.insert = _wrapped_dir_insert
 
         self.after(100, self._enable_mousewheel_scrolling)
 
@@ -1053,22 +1224,30 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
             "atlas": self.atlas_entry,
         }
 
-        leftovers = []
+        if len(paths) == 1:
+            try:
+                dropped = Path(paths[0])
+            except Exception:
+                dropped = None
+            if dropped is not None and dropped.is_dir():
+                self.export_dir_entry.delete(0, "end")
+                self.export_dir_entry.insert(0, str(dropped))
+                self._autofill_animation_from_folder(str(dropped))
+                self._sync_input_mode()
+                return getattr(event, "action", None)
+
         for path in paths:
             key = self._classify_dropped_file(path)
             if key is None:
                 continue
             entry = entries[key]
+            if not entry._drops_enabled:
+                self._append_log_panel(
+                    f"Ignored dropped file (field is disabled in folder mode): {path}"
+                )
+                continue
             existing = entry.get().strip()
             if existing and Path(existing) != Path(path):
-                leftovers.append((key, path))
-                continue
-            entry.delete(0, "end")
-            entry.insert(0, path)
-
-        for key, path in leftovers:
-            entry = entries[key]
-            if entry.get().strip():
                 self._append_log_panel(
                     f"Ignored dropped file (a different {key} is already "
                     f"selected): {path}"
@@ -1091,6 +1270,7 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
         self.settings.remember_paths = enabled
 
         if enabled:
+            self.settings.set("export_dir", self.export_dir_entry.get().strip())
             self.settings.set("animation_path", self.animation_entry.get().strip())
             self.settings.set("spritemap_path", self.spritemap_entry.get().strip())
             self.settings.set("atlas_path", self.atlas_entry.get().strip())
@@ -1113,12 +1293,14 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
         self.settings.save()
 
     def _toggle_log_panel(self):
-        if self.log_panel.winfo_ismapped():
+        if self._log_visible:
             self.log_panel.grid_remove()
             self.log_toggle.configure(text="Show Log")
+            self._log_visible = False
         else:
             self.log_panel.grid()
             self.log_toggle.configure(text="Hide Log")
+            self._log_visible = True
             rebind = getattr(self, "_rebind_mousewheel", None)
             if rebind is not None:
                 self.after_idle(lambda: rebind(self.scroll_frame))
@@ -1169,7 +1351,7 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
             pass
 
     def _log(self, message: str):
-        print(f"[AdobeSpritemapRenderer] {message}")
+        print(f"[app] {message}")
         self._append_log_panel(message)
 
     def _on_progress(self, current, total, name, frame_i=0, frame_n=0):
@@ -1237,20 +1419,31 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _update_export_button_state(self):
         try:
-            required = (
-                self.animation_entry.get().strip(),
-                self.spritemap_entry.get().strip(),
-                self.atlas_entry.get().strip(),
-                self.output_entry.get().strip(),
-            )
+            output_ok = bool(self.output_entry.get().strip())
             worker_busy = self.worker is not None and self.worker.is_alive()
-            self.export_button.configure(
-                state="normal" if all(required) and not worker_busy else "disabled"
-            )
+
+            if self._in_folder_mode():
+                enabled = (
+                    bool(self.export_dir_entry.get().strip())
+                    and output_ok
+                    and not worker_busy
+                )
+            else:
+                required = (
+                    self.animation_entry.get().strip(),
+                    self.spritemap_entry.get().strip(),
+                    self.atlas_entry.get().strip(),
+                    self.output_entry.get().strip(),
+                )
+                enabled = all(required) and not worker_busy
+
+            self.export_button.configure(state="normal" if enabled else "disabled")
         except Exception:
             pass
 
     def _start_export(self):
+        if str(self.export_button.cget("state")) == "disabled":
+            return
         if self.worker is not None:
             if not self.worker.wait(timeout=2.0):
                 CTkMessagebox(
@@ -1264,44 +1457,147 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
                 )
                 return
             self.worker = None
-        animation_path = Path(self.animation_entry.get().strip())
-        spritemap_path = Path(self.spritemap_entry.get().strip())
-        atlas_path = Path(self.atlas_entry.get().strip())
-        output_dir = Path(self.output_entry.get().strip())
 
-        if not all(
-            (
-                self.animation_entry.get().strip(),
-                self.spritemap_entry.get().strip(),
-                self.atlas_entry.get().strip(),
-                self.output_entry.get().strip(),
-            )
-        ):
-            CTkMessagebox(
-                master=self,
-                title="Missing Input",
-                message="Please fill in all file and folder paths.",
-                icon="warning",
-                option_1="OK",
-                sound=True,
-            )
-            return
+        in_folder_mode = self._in_folder_mode()
 
-        for label, path in (
-            ("Animation JSON", animation_path),
-            ("Spritemap JSON", spritemap_path),
-            ("Spritemap PNG", atlas_path),
-        ):
-            if not path.is_file():
+        animation_path = Path(self.animation_entry.get().strip() or ".")
+        output_dir = Path(self.output_entry.get().strip() or ".")
+
+        export_dir_str = self.export_dir_entry.get().strip()
+        export_dir = Path(export_dir_str) if export_dir_str else None
+
+        spritemap_path_str = self.spritemap_entry.get().strip()
+        atlas_path_str = self.atlas_entry.get().strip()
+
+        if in_folder_mode:
+            if not export_dir or not export_dir.is_dir():
                 CTkMessagebox(
                     master=self,
-                    title="File Not Found",
-                    message=f"{label} not found:\n{path}",
+                    title="Folder Not Found",
+                    message=f"Export folder not found:\n{export_dir}",
                     icon="warning",
                     option_1="OK",
                     sound=True,
                 )
                 return
+
+            if not _folder_has_spritemap_pages(export_dir):
+                CTkMessagebox(
+                    master=self,
+                    title="No Spritemap Pages",
+                    message=(
+                        f"No spritemap*.json file found in:\n{export_dir}\n\n"
+                        "Make sure this folder contains an Adobe Animate / BTA "
+                        "spritemap export."
+                    ),
+                    icon="warning",
+                    option_1="OK",
+                    sound=True,
+                )
+                return
+
+            if not self.animation_entry.get().strip():
+                auto = _find_animation_json(export_dir)
+                if auto is None:
+                    CTkMessagebox(
+                        master=self,
+                        title="Missing Animation JSON",
+                        message=(
+                            f"No Animation.json found in:\n{export_dir}\n\n"
+                            "Select the animation document manually or use the "
+                            "folder's expected layout."
+                        ),
+                        icon="warning",
+                        option_1="OK",
+                        sound=True,
+                    )
+                    return
+                animation_path = auto
+                self.animation_entry.delete(0, "end")
+                self.animation_entry.insert(0, str(auto))
+            else:
+                animation_path = Path(self.animation_entry.get().strip())
+
+            if not animation_path.is_file():
+                CTkMessagebox(
+                    master=self,
+                    title="File Not Found",
+                    message=f"Animation JSON not found:\n{animation_path}",
+                    icon="warning",
+                    option_1="OK",
+                    sound=True,
+                )
+                return
+
+            renderer_spritemap_path = str(export_dir)
+            renderer_atlas_path = None
+
+            try:
+                validate_animation_json(animation_path)
+            except ValueError as exc:
+                CTkMessagebox(
+                    master=self,
+                    title="Invalid Input",
+                    message=str(exc),
+                    icon="warning",
+                    option_1="OK",
+                    sound=True,
+                )
+                return
+        else:
+            animation_path = Path(self.animation_entry.get().strip())
+            spritemap_path = Path(spritemap_path_str) if spritemap_path_str else None
+            atlas_path = Path(atlas_path_str) if atlas_path_str else None
+
+            if not all(
+                (
+                    animation_path,
+                    spritemap_path,
+                    atlas_path,
+                )
+            ):
+                CTkMessagebox(
+                    master=self,
+                    title="Missing Input",
+                    message="Please fill in all file and folder paths.",
+                    icon="warning",
+                    option_1="OK",
+                    sound=True,
+                )
+                return
+
+            for label, path in (
+                ("Animation JSON", animation_path),
+                ("Spritemap JSON", spritemap_path),
+                ("Spritemap PNG", atlas_path),
+            ):
+                if not path.is_file():
+                    CTkMessagebox(
+                        master=self,
+                        title="File Not Found",
+                        message=f"{label} not found:\n{path}",
+                        icon="warning",
+                        option_1="OK",
+                        sound=True,
+                    )
+                    return
+
+            try:
+                validate_animation_json(animation_path)
+                validate_animation_json(spritemap_path)
+            except ValueError as exc:
+                CTkMessagebox(
+                    master=self,
+                    title="Invalid Input",
+                    message=str(exc),
+                    icon="warning",
+                    option_1="OK",
+                    sound=True,
+                )
+                return
+
+            renderer_spritemap_path = str(spritemap_path)
+            renderer_atlas_path = str(atlas_path)
 
         if not output_dir.is_dir():
             CTkMessagebox(
@@ -1331,20 +1627,6 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
             return
 
         try:
-            validate_animation_json(animation_path)
-            validate_animation_json(spritemap_path)
-        except ValueError as exc:
-            CTkMessagebox(
-                master=self,
-                title="Invalid Input",
-                message=str(exc),
-                icon="cancel",
-                option_1="OK",
-                sound=True,
-            )
-            return
-
-        try:
             duration = int(self.duration_var.get())
             loop = int(self.loop_var.get())
         except ValueError:
@@ -1352,7 +1634,7 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
                 master=self,
                 title="Invalid Input",
                 message="Duration and Loop must be numbers.",
-                icon="cancel",
+                icon="warning",
                 option_1="OK",
                 sound=True,
             )
@@ -1362,7 +1644,7 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
                 master=self,
                 title="Invalid Input",
                 message="Duration must be a positive integer.",
-                icon="cancel",
+                icon="warning",
                 option_1="OK",
                 sound=True,
             )
@@ -1372,7 +1654,7 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
                 master=self,
                 title="Invalid Input",
                 message="Loop must be 0 (infinite) or a positive integer.",
-                icon="cancel",
+                icon="warning",
                 option_1="OK",
                 sound=True,
             )
@@ -1388,7 +1670,8 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
         try:
             with log_path.open("a", encoding="utf-8") as fh:
                 fh.write(
-                    f"\n=== New export {datetime.now().isoformat(timespec='seconds')} ===\n"
+                    f"\n=== New export {datetime.now().isoformat(timespec='seconds')} ==="
+                    f"{' (folder mode)' if in_folder_mode else ''}\n"
                 )
         except Exception:
             log_path = None
@@ -1402,8 +1685,8 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
 
         self.worker = ExportWorker(
             animation_path=str(animation_path),
-            spritemap_json_path=str(spritemap_path),
-            atlas_image_path=str(atlas_path),
+            spritemap_json_path=renderer_spritemap_path,
+            atlas_image_path=renderer_atlas_path,
             output_dir=str(output_dir),
             duration=duration,
             loop=loop,
@@ -1451,9 +1734,8 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
     def _set_exporting(self, exporting: bool):
         state = "disabled" if exporting else "normal"
         for widget in (
+            self.export_dir_entry,
             self.animation_entry,
-            self.spritemap_entry,
-            self.atlas_entry,
             self.output_entry,
             self.duration_entry,
             self.loop_entry,
@@ -1464,6 +1746,17 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
                 widget.configure(state=state)
             except Exception:
                 pass
+
+        file_state = state
+        if not exporting and self._in_folder_mode():
+            file_state = "disabled"
+        for widget in (self.spritemap_entry, self.atlas_entry):
+            try:
+                widget.configure(state=file_state)
+            except Exception:
+                pass
+            if hasattr(widget, "_drops_enabled"):
+                widget._drops_enabled = file_state == "normal"
 
         for widget in (
             self.filter_single_check,
@@ -1502,11 +1795,13 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
         self._toggle_duration()
 
         if s.remember_paths:
+            self.export_dir_entry.insert(0, s.get("export_dir", "") or "")
             self.animation_entry.insert(0, s.get("animation_path", "") or "")
             self.spritemap_entry.insert(0, s.get("spritemap_path", "") or "")
             self.atlas_entry.insert(0, s.get("atlas_path", "") or "")
             self.output_entry.insert(0, s.get("output_dir", "") or "")
 
+        self._sync_input_mode()
         self._update_export_button_state()
 
     def _collect_settings_into_store(self):
@@ -1530,6 +1825,7 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
             pass
 
         if s.remember_paths:
+            s.set("export_dir", self.export_dir_entry.get().strip())
             s.set("animation_path", self.animation_entry.get().strip())
             s.set("spritemap_path", self.spritemap_entry.get().strip())
             s.set("atlas_path", self.atlas_entry.get().strip())
@@ -1539,6 +1835,7 @@ class MainWindow(ctk.CTk, TkinterDnD.DnDWrapper):
         self._closing = True
         if self.worker is not None and self.worker.is_alive():
             self.worker.cancel()
+            self.worker.wait(timeout=3.0)
         try:
             self._collect_settings_into_store()
             self.settings.save()

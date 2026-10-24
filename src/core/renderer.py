@@ -1,8 +1,10 @@
 import json
 import math
+import re
 import warnings
 from typing import Any, Dict, Generator, Iterator, List, Optional, Set, Tuple
 from collections import OrderedDict
+from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageChops, ImageColor
@@ -781,43 +783,101 @@ class ColorEffect:
         return f"ColorEffect({self.effect!r})"
 
 
+_SPRITEMAP_PAGE_RE = re.compile(r"^spritemap(\d*)\.json$", re.IGNORECASE)
+
+
+def _discover_render_pages(directory: Path) -> List[Tuple[int, Path]]:
+    if not directory.is_dir():
+        return []
+    found: List[Tuple[int, Path]] = []
+    for entry in directory.iterdir():
+        if not entry.is_file():
+            continue
+        match = _SPRITEMAP_PAGE_RE.match(entry.name)
+        if not match:
+            continue
+        digits = match.group(1)
+        page_index = int(digits) if digits else 1
+        found.append((page_index, entry))
+    found.sort(key=lambda item: item[0])
+    return found
+
+
+def _load_render_pages(
+    page_specs: List[Tuple[int, Path, Optional[dict]]],
+) -> List[Tuple[int, Dict[str, Any], Image.Image]]:
+    pages: List[Tuple[int, Dict[str, Any], Image.Image]] = []
+    for page_index, page_path, pre_parsed in page_specs:
+        if pre_parsed is not None:
+            page_json = pre_parsed
+        else:
+            with open(page_path, "rb") as fp:
+                page_json = json.loads(fp.read().decode("utf-8-sig"))
+        meta = page_json.get("meta") or {}
+        image_name = meta.get("image")
+        if not isinstance(image_name, str) or not image_name:
+            raise FileNotFoundError(
+                f"spritemap page {page_path.name} has no meta.image"
+            )
+        image_path = Path(image_name)
+        if not image_path.is_absolute():
+            image_path = page_path.parent / image_path
+        if not image_path.is_file():
+            raise FileNotFoundError(
+                f"Atlas image for page {page_index} not found: {image_path}"
+            )
+        image = Image.open(image_path)
+        pages.append((page_index, page_json, image))
+    return pages
+
+
 class SpriteAtlas:
-    def __init__(self, spritemap_json, atlas_image, canvas_size, resample):
-        if atlas_image.mode == "P":
-            atlas_image = atlas_image.convert("RGBA")
-        self.img = atlas_image.convert("RGBa")
+    def __init__(self, pages, canvas_size, resample):
+        if not pages:
+            raise ValueError("SpriteAtlas requires at least one page")
+
         self.canvas_width, self.canvas_height = canvas_size
         self.resample = resample
-        self.sprite_info = {}
-        self.sprites = {}
+        self.sprite_info: Dict[str, Dict[str, Any]] = {}
+        self.sprites: Dict[str, Image.Image] = {}
+        self.images: Dict[int, Image.Image] = {}
+        self._scale_by_page: Dict[int, Tuple[float, float]] = {}
         self._composed_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
         self._composed_cache_limit = _COMPOSED_CACHE_LIMIT
         self._warned_oob: set = set()
 
-        actual_w, actual_h = atlas_image.size
-        meta_size = spritemap_json.get("meta", {}).get("size", {})
-        declared_w = meta_size.get("w", actual_w)
-        declared_h = meta_size.get("h", actual_h)
-        self._scale_x = actual_w / declared_w if declared_w and declared_w > 0 else 1.0
-        self._scale_y = actual_h / declared_h if declared_h and declared_h > 0 else 1.0
-        self._needs_rescale = not (
-            0.99 < self._scale_x < 1.01 and 0.99 < self._scale_y < 1.01
-        )
+        for page_index, spritemap_json, atlas_image in pages:
+            if atlas_image.mode == "P":
+                atlas_image = atlas_image.convert("RGBA")
+            page_img = atlas_image.convert("RGBa")
+            self.images[page_index] = page_img
 
-        for sprite in spritemap_json.get("ATLAS", {}).get("SPRITES", []):
-            if not isinstance(sprite, dict):
+            actual_w, actual_h = atlas_image.size
+            meta_size = (spritemap_json.get("meta") or {}).get("size") or {}
+            declared_w = meta_size.get("w", actual_w)
+            declared_h = meta_size.get("h", actual_h)
+            scale_x = actual_w / declared_w if declared_w and declared_w > 0 else 1.0
+            scale_y = actual_h / declared_h if declared_h and declared_h > 0 else 1.0
+            self._scale_by_page[page_index] = (scale_x, scale_y)
+
+            sprites_field = (spritemap_json.get("ATLAS") or {}).get("SPRITES", [])
+            if not isinstance(sprites_field, list):
                 continue
-            data = sprite["SPRITE"] if "SPRITE" in sprite else sprite
-            if not isinstance(data, dict) or "name" not in data:
-                continue
-            x = data.get("x", 0)
-            y = data.get("y", 0)
-            w = data.get("w", 0)
-            h = data.get("h", 0)
-            self.sprite_info[data["name"]] = {
-                "box": (x, y, x + w, y + h),
-                "rotated": data.get("rotated", False),
-            }
+            for sprite in sprites_field:
+                if not isinstance(sprite, dict):
+                    continue
+                data = sprite["SPRITE"] if "SPRITE" in sprite else sprite
+                if not isinstance(data, dict) or "name" not in data:
+                    continue
+                x = data.get("x", 0)
+                y = data.get("y", 0)
+                w = data.get("w", 0)
+                h = data.get("h", 0)
+                self.sprite_info[data["name"]] = {
+                    "box": (x, y, x + w, y + h),
+                    "rotated": data.get("rotated", False),
+                    "page": page_index,
+                }
 
     def get_sprite(self, name, matrix, color, canvas_width, canvas_height):
         cache_key = None
@@ -838,21 +898,30 @@ class SpriteAtlas:
             sprite_info = self.sprite_info.get(name)
             if sprite_info is None:
                 return None, None
+
+            page_index = sprite_info["page"]
+            page_img = self.images.get(page_index)
+            if page_img is None:
+                return None, None
+
             box = sprite_info["box"]
-            if self._needs_rescale:
+            scale_x, scale_y = self._scale_by_page.get(page_index, (1.0, 1.0))
+            needs_rescale = not (0.99 < scale_x < 1.01 and 0.99 < scale_y < 1.01)
+
+            if needs_rescale:
                 scaled_box = (
-                    round(box[0] * self._scale_x),
-                    round(box[1] * self._scale_y),
-                    round(box[2] * self._scale_x),
-                    round(box[3] * self._scale_y),
+                    round(box[0] * scale_x),
+                    round(box[1] * scale_y),
+                    round(box[2] * scale_x),
+                    round(box[3] * scale_y),
                 )
-                sprite = self.img.crop(scaled_box)
+                sprite = page_img.crop(scaled_box)
                 orig_w = box[2] - box[0]
                 orig_h = box[3] - box[1]
                 if sprite.size != (orig_w, orig_h):
                     sprite = sprite.resize((orig_w, orig_h), self.resample)
             else:
-                sprite = self.img.crop(box)
+                sprite = page_img.crop(box)
             if sprite_info.get("rotated"):
                 sprite = sprite.transpose(Image.ROTATE_90)
             self.sprites[name] = sprite
@@ -921,13 +990,14 @@ class SpriteAtlas:
         if getattr(self, "_warned_oob", None) is not None:
             self._warned_oob.clear()
 
-        if getattr(self, "img", None) is not None:
-            try:
-                self.img.close()
-            except Exception:
-                pass
-            finally:
-                self.img = None
+        if getattr(self, "images", None):
+            for img in self.images.values():
+                try:
+                    if img is not None:
+                        img.close()
+                except Exception:
+                    pass
+            self.images.clear()
 
 
 def _union_bounds(
@@ -1021,6 +1091,9 @@ class Symbols:
         for frame_index in frame_indices:
             b = self._compute_bounds(name, frame_index, self.center_in_canvas)
             union = _union_bounds(union, b)
+
+        if union is None:
+            return None
 
         canvas_w, canvas_h = self.canvas_size
         clamped = (
@@ -1527,7 +1600,12 @@ def _element_bounds(element, sprite_sizes, symbol_bounds_fn):
     return None
 
 
-def _infer_canvas_size(animation_json, spritemap_json, atlas_size):
+def _infer_canvas_size(animation_json, spritemap_json, page_sizes):
+    page_sizes = list(page_sizes) or [(0, 0)]
+    atlas_w = max(w for w, _ in page_sizes)
+    atlas_h = max(h for _, h in page_sizes)
+    atlas_size = (atlas_w, atlas_h)
+
     sprite_sizes = _collect_sprite_sizes(spritemap_json)
     if not sprite_sizes:
         return atlas_size
@@ -1612,8 +1690,8 @@ class AdobeSpritemapRenderer:
     def __init__(
         self,
         animation_path: str,
-        spritemap_json_path: str,
-        atlas_image_path: str,
+        spritemap_json_path,
+        atlas_image_path=None,
         canvas_size=None,
         resample=Image.BICUBIC,
         filter_single_frame: bool = True,
@@ -1622,25 +1700,31 @@ class AdobeSpritemapRenderer:
         animate_movie_clips: bool = True,
     ):
         self.animation_path = animation_path
-        self.spritemap_json_path = spritemap_json_path
-        self.atlas_image_path = atlas_image_path
 
         with open(animation_path, "r", encoding="utf-8-sig") as animation_file:
             self.animation_json = normalize_animation_document(
                 json.load(animation_file)
             )
 
-        with open(spritemap_json_path, "rb") as spritemap_file:
-            spritemap_json = json.loads(spritemap_file.read().decode("utf-8-sig"))
-
-        atlas_image = Image.open(atlas_image_path)
+        pages: List[Tuple[int, Dict[str, Any], Image.Image]] = []
         try:
+            page_specs = self._resolve_page_specs(spritemap_json_path, atlas_image_path)
+            pages = _load_render_pages(page_specs)
+
+            merged_spritemap: Dict[str, Any] = {"ATLAS": {"SPRITES": []}}
+            for _, page_json, _ in pages:
+                atlas = page_json.get("ATLAS") or {}
+                sprites = atlas.get("SPRITES")
+                if isinstance(sprites, list):
+                    merged_spritemap["ATLAS"]["SPRITES"].extend(sprites)
+
+            page_sizes = [img.size for _, _, img in pages]
+
             if canvas_size is None:
                 canvas_size = _infer_canvas_size(
-                    self.animation_json,
-                    spritemap_json,
-                    atlas_image.size,
+                    self.animation_json, merged_spritemap, page_sizes
                 )
+
             self.frame_rate = self.animation_json.get("MD", {}).get("FRT", 24)
             self.filter_single_frame = filter_single_frame
             self.filter_unused_symbols = filter_unused_symbols
@@ -1657,9 +1741,7 @@ class AdobeSpritemapRenderer:
             else:
                 self._referenced_symbols = None
 
-            self.sprite_atlas = SpriteAtlas(
-                spritemap_json, atlas_image, canvas_size, resample
-            )
+            self.sprite_atlas = SpriteAtlas(pages, canvas_size, resample)
             self.symbols = Symbols(
                 self.animation_json,
                 self.sprite_atlas,
@@ -1667,7 +1749,57 @@ class AdobeSpritemapRenderer:
                 animate_movie_clips=animate_movie_clips,
             )
         finally:
-            atlas_image.close()
+            for _, _, img in pages:
+                try:
+                    img.close()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _resolve_page_specs(spritemap_json_path, atlas_image_path):
+        if spritemap_json_path is None:
+            raise ValueError("spritemap_json_path is required")
+
+        metadata = getattr(spritemap_json_path, "metadata", None)
+        if isinstance(metadata, dict) and "spritemap" in metadata:
+            pages_meta = metadata["spritemap"].get("pages") or []
+            animation_file = getattr(spritemap_json_path, "file_path", None)
+            if not animation_file:
+                raise ValueError("ParseResult-like object must expose .file_path")
+            animation_dir = Path(animation_file).parent
+            specs: List[Tuple[int, Path, Optional[dict]]] = []
+            for entry in pages_meta:
+                file_name = entry.get("file")
+                page_index = entry.get("page")
+                if not file_name or page_index is None:
+                    continue
+                specs.append((int(page_index), animation_dir / file_name, None))
+            if specs:
+                specs.sort(key=lambda item: item[0])
+                return specs
+            raise ValueError("ParseResult contains no spritemap pages")
+
+        if isinstance(spritemap_json_path, list):
+            return [(int(idx), Path(path), None) for idx, path in spritemap_json_path]
+
+        path = Path(spritemap_json_path)
+        if path.is_dir():
+            discovered = _discover_render_pages(path)
+            if not discovered:
+                raise FileNotFoundError(f"No spritemap*.json found in {path}")
+            return [(idx, p, None) for idx, p in discovered]
+
+        if not path.is_file():
+            raise FileNotFoundError(f"Spritemap JSON not found: {path}")
+        if atlas_image_path is None:
+            raise ValueError(
+                "atlas_image_path is required when spritemap_json_path is a file"
+            )
+        with open(path, "rb") as fp:
+            page_json = json.loads(fp.read().decode("utf-8-sig"))
+        meta = page_json.setdefault("meta", {})
+        meta["image"] = str(atlas_image_path)
+        return [(1, path, page_json)]
 
     def get_root_animation_name(self) -> Optional[str]:
         an = self.animation_json.get("AN", {})
